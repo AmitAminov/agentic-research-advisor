@@ -1,0 +1,6 @@
+# Development / CI dependencies for the harness code (scripts/ + tests/).
+# CI (.github/workflows/ci.yml) installs the latest ruff + pytest (plus
+# `requests`, which is already in requirements.txt); the floors below match
+# the versions the suite is verified against locally.
+pytest>=9.1
+ruff>=0.15

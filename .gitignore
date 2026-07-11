@@ -1,0 +1,56 @@
+# secrets / local config
+config.json
+
+# python env
+.venv/
+__pycache__/
+*.pyc
+
+# runtime state & logs (regenerated each run; dirs kept via .gitkeep)
+logs/*.log
+state/harvests/*.json
+state/daily/*
+state/progress.jsonl
+state/.transitioned
+
+# large local caches
+.harvest_cache/
+
+# ---------------------------------------------------------------------------
+# media hygiene for per-paper reproduction folders (repo-bloat guard)
+# NOTE: files that were tracked before these rules were added stay tracked;
+# see the "Repository size" section of the README for the pruning plan.
+# ---------------------------------------------------------------------------
+# manim render intermediates: partial movie files + multi-resolution copies.
+# Only the final manim/<name>.mp4|.gif next to scene.py is meant to be kept.
+**/manim/_media/
+**/manim/media/
+**/manim/render.log
+# harvested third-party paper PDFs: kept on disk for the pipeline but not
+# redistributed via git - each paper folder holds a PAPER_SOURCE.md
+# (arXiv/DOI link) instead. Our own generated summary.pdf stays tracked.
+**/paper.pdf
+# bulk raw datasets do not belong in git - each paper's original_data/ should
+# hold a DATA_SOURCE.md (URL, size, license) instead of the payload itself.
+**/original_data/*.cov
+**/original_data/*.fits
+**/original_data/*.hdf5
+**/original_data/*.h5
+**/original_data/*.npz
+**/original_data/*.zip
+**/original_data/*.tar
+**/original_data/*.tar.gz
+**/original_data/*.parquet
+# nested-capable: bulk datasets often live in a subdir (e.g. original_data/mnist/)
+**/original_data/**/*.gz
+**/original_data/**/*-ubyte
+
+# OS
+Thumbs.db
+.DS_Store
+
+# always keep directory placeholders
+!**/.gitkeep
+
+# relocated wiki project (moved off OneDrive) - do not track its 9GB corpus
+/AI_DS_ML_DL/

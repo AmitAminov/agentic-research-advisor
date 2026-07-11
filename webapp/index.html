@@ -1,0 +1,51 @@
+<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Agentic AI Researcher — Computational Observatory</title>
+<link rel="icon" type="image/svg+xml" href="assets/favicon.svg?v=3">
+<link rel="icon" href="assets/favicon.ico?v=3" sizes="any">
+<link rel="apple-touch-icon" href="assets/apple-touch-icon.png?v=3">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Agentic AI Researcher — Computational Observatory">
+<meta property="og:description" content="Autonomous paper reproduction — reproduced results, honestly evaluated.">
+<meta property="og:image" content="assets/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="assets/og-image.png">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Spectral:ital,wght@0,400;0,600;0,700;0,800;1,400&family=Orbitron:wght@600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap">
+<link rel=stylesheet href="assets/style.css"></head><body>
+<div class="bg-grid" aria-hidden="true"></div>
+<header class=hero>
+  <div class=eyebrow>Computational Observatory</div>
+  <div class="hero-orb" id="hero-orb" aria-hidden="true"><noscript><img src="assets/brand-emblem.png" alt="" width=110 height=110 style="border-radius:16px"></noscript></div>
+  <h1 class=wordmark>Agentic AI Researcher</h1>
+  <div class=tagline>Autonomous paper reproduction</div>
+  <div class=stats><div class="stat"><b>224</b><span>papers</span></div><div class="stat"><b>48</b><span>reproduced</span></div><div class="stat"><b>224</b><span>animated</span></div><div class="stat"><b>114</b><span>tests written</span></div><span class="stat-sep"></span><div class="stat area" style="--c:#A78BFA"><b>78</b><span>AI</span></div><div class="stat area" style="--c:#38BDF8"><b>54</b><span>DS</span></div><div class="stat area" style="--c:#34D399"><b>40</b><span>ML</span></div><div class="stat area" style="--c:#FBBF24"><b>52</b><span>DL</span></div></div>
+</header>
+<div class=wrap>
+  <div class=controls>
+    <input id=q aria-label="Search papers by title, area, or venue" placeholder="Search 224 papers by title, area, venue…   ( press / )">
+    <div class=chipset>
+      <button type=button class="chip active" aria-pressed=true data-group=area data-area=ALL>All</button>
+      <button type="button" class="chip" data-group="area" data-area="AI" aria-pressed="false" style="--c:#A78BFA"><span class="cdot"></span>AI<span class="chip-n">78</span></button><button type="button" class="chip" data-group="area" data-area="DS" aria-pressed="false" style="--c:#38BDF8"><span class="cdot"></span>DS<span class="chip-n">54</span></button><button type="button" class="chip" data-group="area" data-area="ML" aria-pressed="false" style="--c:#34D399"><span class="cdot"></span>ML<span class="chip-n">40</span></button><button type="button" class="chip" data-group="area" data-area="DL" aria-pressed="false" style="--c:#FBBF24"><span class="cdot"></span>DL<span class="chip-n">52</span></button>
+    </div>
+    <span class=sep></span>
+    <div class=chipset>
+      <button type=button class="chip active" aria-pressed=true data-group=status data-status=ALL>Any status</button>
+      <button type=button class=chip aria-pressed=false data-group=status data-status=reproduced>Reproduced</button>
+      <button type=button class=chip aria-pressed=false data-group=status data-status=animated>Animated</button>
+    </div>
+    <span class=sep></span>
+    <div class=chipset>
+      <button type=button class="chip active" aria-pressed=true data-group=verdict data-verdict=ALL>Any verdict</button>
+      <button type=button class=chip aria-pressed=false data-group=verdict data-verdict=full>Full</button>
+      <button type=button class=chip aria-pressed=false data-group=verdict data-verdict=partial>Partial</button>
+      <button type=button class=chip aria-pressed=false data-group=verdict data-verdict=minimal>Minimal</button>
+    </div>
+  </div>
+  <div class="legend" aria-label="status legend"><span class="lg"><span class="dot ok"></span>reproduced</span><span class="lg"><span class="dot warn"></span>pending</span><span class="lg-sep"></span><span class="lg vk full"><span class="vchip ok">full</span>39</span><span class="lg vk partial"><span class="vchip warn">partial</span>7</span><span class="lg vk minimal"><span class="vchip bad">minimal</span>178</span></div>
+  <div class=grid><div class="empty-state"><h2>Public snapshot</h2><p class="muted">This is the public code + dashboard snapshot of the harness. The per-paper reproductions (harvested PDFs, reproduced figures, tests, and Manim animations) live in the private corpus and are not redistributed here for copyright reasons. The counts above are the live totals from the full run.</p></div>
+    <div id=noresults class=no-results role=status aria-live=polite style="display:none">No papers match your filters.</div>
+  </div>
+</div>
+<script src="assets/app.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+<script src="assets/hero-3d.js"></script></body></html>

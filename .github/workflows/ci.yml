@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # the harness lives in scripts/ + tests/; skip the heavy per-paper
+          # reproduction artifacts (PDFs, figures, videos) in CI checkouts.
+          sparse-checkout: |
+            scripts
+            tests
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install lint/test dependencies
+        # requests is the only third-party import the tested modules need;
+        # PDF/render/email extras are optional at import time by design.
+        run: python -m pip install --upgrade pip ruff pytest requests
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Test (pytest)
+        run: pytest tests -q

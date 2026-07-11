@@ -1,0 +1,22 @@
+# Lint scope: the harness itself (scripts/ + tests/).
+# The per-paper directories under AI/ DS/ ML/ DL/ contain agent-generated
+# reproduction code; they are pipeline OUTPUT, not maintained source, and are
+# deliberately excluded (see README: "What I built vs. what the agents produce").
+include = ["scripts/**/*.py", "tests/**/*.py"]
+extend-exclude = ["AI", "DS", "ML", "DL", "AI_DS_ML_DL", "webapp", ".venv", "state", "logs"]
+line-length = 100
+target-version = "py310"
+
+[lint.per-file-ignores]
+# manim_scientific.py deliberately re-exports manim names for the generated
+# per-paper scene files (they do `import manim_scientific as ms`).
+"scripts/manim_scientific.py" = ["F401"]
+
+[lint]
+select = [
+    "E4",   # imports
+    "E7",   # statement style
+    "E9",   # syntax / runtime errors
+    "F",    # pyflakes (undefined names, unused imports, ...)
+    "W6",   # deprecated usage
+]

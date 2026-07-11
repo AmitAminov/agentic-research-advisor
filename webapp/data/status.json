@@ -1,0 +1,19 @@
+{
+  "generated": "2026-07-11T16:41:41",
+  "total": 224,
+  "reproduced": 48,
+  "animated": 224,
+  "tests_passing": 0,
+  "by_area": {
+    "AI": 78,
+    "DS": 54,
+    "ML": 40,
+    "DL": 52
+  },
+  "by_verdict": {
+    "full": 39,
+    "partial": 7,
+    "minimal": 178
+  },
+  "papers": []
+}

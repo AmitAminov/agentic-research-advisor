@@ -1,0 +1,6 @@
+# Researcher pipeline dependencies (installed into .venv, Python 3.10)
+requests>=2.28
+pymupdf4llm>=0.0.17
+reportlab>=4.0      # per-paper summary.pdf generation (send_report.py)
+pypdf>=4.0          # merge per-paper summaries into the unified PDF (send_report.py)
+pillow>=10.0        # figure sizing/embedding for summary PDFs
