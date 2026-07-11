@@ -205,7 +205,30 @@ if (-not $enablePush) {
 } else {
   $msg = "session pipeline ${stamp}: harvest + ingest + reproduce + webapp + qa + email + manim"
   & $py (Join-Path $scripts "github_sync.py") $msg 2>&1 | ForEach-Object { Log "  [git] $_" }
-  Log "  github_sync exit=$LASTEXITCODE"
+  $syncExit = $LASTEXITCODE
+  Log "  github_sync exit=$syncExit"
+
+  # ---- 9. PUBLIC SYNC ------------------------------------------------
+  #  Mirror ONLY the publishable subset (harness code + dashboard shell,
+  #  never the AI/DS/ML/DL paper trees) to the PUBLIC repo
+  #  agentic-research-advisor. Allowlist-first with a hard leak guard --
+  #  see public_sync.py. Runs only after a successful private push. Active
+  #  by default; disable by setting "public_sync": { "enabled": false } in
+  #  config.json.
+  $pubSync = $true
+  if ($conf.PSObject.Properties['public_sync'] -and
+      $conf.public_sync.PSObject.Properties['enabled']) {
+    $pubSync = [bool]$conf.public_sync.enabled
+  }
+  if (-not $pubSync) {
+    Log "  [public] SKIP: public_sync.enabled=false in config."
+  } elseif ($syncExit -ne 0) {
+    Log "  [public] SKIP: private github_sync did not succeed (exit=$syncExit)."
+  } else {
+    Log "STEP 9: public sync (mirror publishable subset -> agentic-research-advisor)"
+    & $py (Join-Path $scripts "public_sync.py") 2>&1 | ForEach-Object { Log "  [public] $_" }
+    Log "  public_sync exit=$LASTEXITCODE"
+  }
 }
 
 Log "SESSION PIPELINE COMPLETE."

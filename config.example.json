@@ -8,6 +8,10 @@
     "git_user_name": "",
     "git_user_email": ""
   },
+  "public_sync": {
+    "comment": "After each successful private push, mirror ONLY the publishable subset (harness code + dashboard shell, never the AI/DS/ML/DL paper trees) to the PUBLIC repo agentic-research-advisor. Allowlist-first with a hard leak guard (scripts/public_sync.py). Active by default; set enabled=false to stop mirroring.",
+    "enabled": true
+  },
   "email": {
     "comment": "Optional. To receive daily reports, set enabled=true and provide a Gmail App Password OR a SendGrid API key. See SETUP.md.",
     "enabled": false,
