@@ -1,0 +1,41 @@
+name: Deploy dashboard to GitHub Pages
+
+# Publishes the static dashboard in webapp/ to GitHub Pages.
+# The site is pure static HTML/CSS/JS (no build step, no backend, no secrets),
+# so we upload webapp/ as-is and deploy it. Asset links in index.html are
+# relative, so it serves correctly under the /agentic-research-advisor/ subpath.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "webapp/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+# Least-privilege token: read the repo, write the Pages deployment, mint the
+# OIDC token deploy-pages needs. No other scopes.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Serialize deploys; never cancel a publish that is already in flight.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: webapp
+      - id: deployment
+        uses: actions/deploy-pages@v4
