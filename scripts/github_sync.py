@@ -30,6 +30,7 @@ Constraints honoured:
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -73,17 +74,26 @@ _UA_SUFFIX = "+github-sync"
 def _read_token() -> str:
     """Return the PAT with surrounding whitespace stripped.
 
-    Resolved via the shared secret helper with a safe fallback chain:
-    GITHUB_TOKEN env -> Google Secret Manager (secret 'github-pat', ADC) ->
-    gcloud CLI -> the optional local token file (github.token_file in config.json
-    or the GITHUB_TOKEN_FILE environment variable). The token is only ever held
-    in a local variable; it is never printed, logged, or written anywhere.
+    Resolution order (changed 2026-07-17): **Google Secret Manager FIRST**
+    (secret 'github-pat', ADC -> gcloud CLI), then the GITHUB_TOKEN env var,
+    then the optional local token file. This host carries a stale GITHUB_TOKEN
+    in the user AND machine environment that GitHub rejects with 403 on push;
+    env-first resolution made every unattended push fail (the 2026-07-15/16
+    session artifacts were left committed-but-unpushed by exactly this). The
+    canonical credential is Secret Manager's github-pat (user-level policy);
+    env is only a fallback when SM/gcloud are unavailable. The token is only
+    ever held in a local variable; never printed, logged, or written anywhere.
     """
     token_file = pipeline_paths.token_file(_load_config())
-    token = get_secret(
-        "github-pat", env="GITHUB_TOKEN",
-        file_fallback=str(token_file) if token_file else None,
-    ).strip()
+    try:
+        token = get_secret("github-pat", env=None).strip()  # SM/gcloud only
+    except Exception:  # noqa: BLE001 - fall back to env/file below
+        token = ""
+    if not token:
+        token = get_secret(
+            "github-pat", env="GITHUB_TOKEN",
+            file_fallback=str(token_file) if token_file else None,
+        ).strip()
     if not token:
         raise ValueError("GitHub token is empty.")
     return token
@@ -285,15 +295,22 @@ def commit_and_push(message: str) -> bool:
     else:
         print("[git] nothing to commit (no pipeline-output changes).")
 
-    # Push using an authenticated URL passed as an argument (in memory only).
-    # Output is suppressed so the token can never leak via stdout/stderr.
-    # IMPORTANT: do NOT pass -u here -- that would persist the authenticated
-    # URL into .git/config as branch.<name>.remote. We push by explicit URL
-    # and manage upstream separately against the clean 'origin' remote.
-    push_url = _authed_push_url(owner, token)
+    # Push to the CLEAN origin URL, authenticating via an in-memory credential
+    # helper (the user-level standard pattern, proven 2026-07-17: a push by
+    # token-embedded URL was refused with 403 while the same token via the
+    # credential helper succeeded). GIT_TERMINAL_PROMPT=0 fails fast instead of
+    # popping a logon prompt; the token lives only in the child environment for
+    # the duration of the command and is never stored, printed, or committed.
+    clean_url = _clean_https_url(owner)
+    push_env = dict(os.environ)
+    push_env["GIT_TERMINAL_PROMPT"] = "0"
+    push_env["GIT_PUSH_TOKEN"] = token
+    helper = "!f() { echo username=x-access-token; echo \"password=$GIT_PUSH_TOKEN\"; }; f"
     proc = subprocess.run(
-        ["git", "push", push_url, f"HEAD:{BRANCH}"],
+        ["git", "-c", "credential.helper=", "-c", f"credential.helper={helper}",
+         "push", clean_url, f"HEAD:{BRANCH}"],
         cwd=str(REPO_ROOT),
+        env=push_env,
         capture_output=True,
         text=True,
     )

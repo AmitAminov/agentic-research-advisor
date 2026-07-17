@@ -1,19 +1,102 @@
 {
-  "generated": "2026-07-11T16:51:17",
-  "total": 224,
-  "reproduced": 48,
-  "animated": 224,
+  "generated": "2026-07-17T14:53:33",
+  "total": 46,
+  "reproduced": 46,
+  "animated": 46,
+  "unpublished_in_pipeline": 16,
+  "publish_verdicts": [
+    "full",
+    "partial"
+  ],
   "tests_passing": 0,
   "by_area": {
-    "AI": 78,
-    "DS": 54,
-    "ML": 40,
-    "DL": 52
+    "AI": 14,
+    "DS": 18,
+    "ML": 6,
+    "DL": 8
   },
   "by_verdict": {
     "full": 39,
     "partial": 7,
-    "minimal": 178
+    "minimal": 0
   },
-  "papers": []
+  "pipeline": {
+    "generated": "2026-07-17T14:53:33",
+    "by_area": {
+      "AI": {
+        "reproduced_full": 9,
+        "reproduced_partial": 5,
+        "in_progress": 3,
+        "failed": 0,
+        "skipped": 1,
+        "queued": 0
+      },
+      "DS": {
+        "reproduced_full": 16,
+        "reproduced_partial": 2,
+        "in_progress": 4,
+        "failed": 0,
+        "skipped": 1,
+        "queued": 0
+      },
+      "ML": {
+        "reproduced_full": 6,
+        "reproduced_partial": 0,
+        "in_progress": 2,
+        "failed": 0,
+        "skipped": 0,
+        "queued": 0
+      },
+      "DL": {
+        "reproduced_full": 8,
+        "reproduced_partial": 0,
+        "in_progress": 5,
+        "failed": 0,
+        "skipped": 0,
+        "queued": 0
+      }
+    },
+    "totals": {
+      "reproduced_full": 39,
+      "reproduced_partial": 7,
+      "in_progress": 14,
+      "failed": 0,
+      "skipped": 2,
+      "queued": 0
+    },
+    "topics_wiki_concepts": 202,
+    "definitions": {
+      "reproduced_full": "heuristic verdict 'full' - central claims confirmed with multiple independent signals",
+      "reproduced_partial": "heuristic verdict 'partial' - some headline results reproduced",
+      "in_progress": "harvested and being worked on / eligible for a bounded retry",
+      "failed": "honest terminal failure (retry budget exhausted or not a reproducible artifact)",
+      "skipped": "first-class policy skip (security policy / hardware envelope)",
+      "queued": "harvested, not yet attempted"
+    }
+  },
+  "papers": [],
+  "projects_total": 3,
+  "projects": [
+    {
+      "slug": "anubhavshrimal-machine-learning",
+      "title": "anubhavshrimal/Machine-Learning",
+      "track_a_status": "EXECUTION_ONLY",
+      "track_b_status": "FUNCTIONALLY_REPRODUCED",
+      "has_modernized": false
+    },
+    {
+      "slug": "autodl-projects",
+      "title": "D-X-Y/AutoDL-Projects",
+      "track_a_status": "BLOCKED_BY_HARDWARE",
+      "track_b_status": "FUNCTIONALLY_REPRODUCED",
+      "has_modernized": false
+    },
+    {
+      "slug": "rag-llama3-langchain-chromadb",
+      "title": "GURPREETKAURJETHRA/RAG-using-Llama3-Langchain-and-ChromaDB",
+      "track_a_status": "BLOCKED_BY_HARDWARE",
+      "track_b_status": "FUNCTIONALLY_REPRODUCED",
+      "has_modernized": true
+    }
+  ]
 }

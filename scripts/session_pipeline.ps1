@@ -1,8 +1,10 @@
 # =====================================================================
 #  SESSION RESEARCH PIPELINE  (GATED full 5-component cycle)
 #
-#  This is the orchestrator fired ~4x/day by session-runner.ps1 (which
-#  approximates the Claude Code / Max-plan token-window resets). It runs
+#  This is the orchestrator fired once/WEEK - Sunday @ 10:00 local time -
+#  by the ResearcherWeeklyReproduction scheduled task (or the detached
+#  session-runner.ps1 fallback daemon). Amit directive 2026-07-17: the
+#  reproduction cadence moved from daily to weekly. It runs
 #  the complete research loop, but ONLY once the LLM-wiki ingest backlog
 #  is fully drained (the gate). While the wiki still has new/unclassified
 #  or pending-in-scope papers, this pipeline stands by and exits 0 so the
@@ -30,8 +32,8 @@
 # =====================================================================
 param(
   [switch]$Force,
-  [int]$ReproduceBudgetMin = 240,   # wall-clock budget for the reproduction phase (~4h fits a 6h cadence)
-  [int]$IngestWorkers = 4,
+  [int]$ReproduceBudgetMin = 360,   # wall-clock budget for the reproduction phase (~6h fits the weekly Sunday cadence)
+  [int]$IngestWorkers = 2,          # concurrent wiki-ingest claude workers (lowered 4->2, Amit 2026-07-12: so wiki-ingest + reproduction don't both draw heavy concurrent quota)
   [int]$IngestPerWorker = 25,
   [int]$ManimTimeout = 300,
   [int]$QaMaxIterations = 3
@@ -88,6 +90,12 @@ if (Test-Path $lockFile) {
 }
 "$PID" | Out-File -FilePath $lockFile -Encoding ascii -Force
 Log "single-instance lock claimed (pid=$PID)."
+
+# ---- heavy-dataset/model cleanup: RETIRED (cloud storage) ----
+#  Heavy datasets/models now live in the cloud registry (gdrive:ML_MODELS + per-project
+#  folders) and are pulled on demand; with ~5 TB of Drive, local disk is no longer a
+#  constraint, so the disk-hygiene sweep (cleanup_heavy_datasets.ps1) is retired here.
+#  The standalone ResearcherDatasetCleanup scheduled task is disabled. See docs/CLOUD_ASSETS.md.
 
 Ensure-VpnForInternet
 

@@ -9,13 +9,14 @@
 #  driven by detached long-lived loops, not scheduled tasks. So the real
 #  transition is:
 #    1. STOP the 20-minute wiki runner-loop  (drop wiki\.ingest\runner.stop)
-#    2. LAUNCH session-runner.ps1 detached    (~4x/day session_pipeline.ps1)
+#    2. LAUNCH session-runner.ps1 detached    (WEEKLY Sunday @ 10:00
+#       session_pipeline.ps1 - Amit directive 2026-07-17)
 #  The scheduled-task toggling is kept as harmless best-effort for any
 #  environment where Task Scheduler does work.
 # =====================================================================
 param(
   [switch]$RunImmediately,           # have session-runner fire one cycle at startup
-  [double]$IntervalHours = 6
+  [double]$IntervalHours = 168       # legacy interval fallback; session-runner now defaults to once/week Sunday @ 10:00 (-WeeklyAtHour 10)
 )
 $ErrorActionPreference = 'Continue'
 
@@ -67,9 +68,11 @@ try {
     }
   }
 
-  # ---- 4. best-effort: enable a daily scheduled task if present ------
-  if (Get-ScheduledTask -TaskName 'WikiDailyResearcher' -ErrorAction SilentlyContinue) {
-    try { Enable-ScheduledTask -TaskName 'WikiDailyResearcher' -ErrorAction Stop | Out-Null; TLog "WikiDailyResearcher ENABLED" } catch { TLog "could not enable WikiDailyResearcher: $_" }
+  # ---- 4. best-effort: enable the weekly scheduled task if present ---
+  #  (ResearcherWeeklyReproduction supersedes the old WikiDailyResearcher;
+  #   weekly Sunday 10:00 - Amit directive 2026-07-17)
+  if (Get-ScheduledTask -TaskName 'ResearcherWeeklyReproduction' -ErrorAction SilentlyContinue) {
+    try { Enable-ScheduledTask -TaskName 'ResearcherWeeklyReproduction' -ErrorAction Stop | Out-Null; TLog "ResearcherWeeklyReproduction ENABLED" } catch { TLog "could not enable ResearcherWeeklyReproduction: $_" }
   }
 
   # ---- 5. marker -----------------------------------------------------

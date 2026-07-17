@@ -1,78 +1,106 @@
 {
-  "github": {
-    "comment": "Optional. Create a repo on GitHub, put its URL here and set enable_push=true. See SETUP.md.",
-    "remote_url": "",
-    "branch": "main",
-    "enable_push": false,
-    "token_file": "",
-    "git_user_name": "",
-    "git_user_email": ""
+ "github": {
+  "comment": "Optional. Create a repo on GitHub, put its URL here and set enable_push=true. See SETUP.md.",
+  "remote_url": "",
+  "branch": "main",
+  "enable_push": false,
+  "token_file": "",
+  "git_user_name": "",
+  "git_user_email": ""
+ },
+ "public_sync": {
+  "comment": "After each successful private push, mirror ONLY the publishable subset (harness code + dashboard shell, never the AI/DS/ML/DL paper trees) to the PUBLIC repo agentic-research-advisor. Allowlist-first with a hard leak guard (scripts/public_sync.py). Active by default; set enabled=false to stop mirroring.",
+  "enabled": true
+ },
+ "email": {
+  "comment": "Optional. To receive daily reports, set enabled=true and provide a Gmail App Password OR a SendGrid API key. See SETUP.md.",
+  "enabled": false,
+  "comment_only_new": "When true, each run only emails papers not delivered before (tracked in state/emailed_ledger.json by paper slug). Run send_report.py --all to bypass and resend the whole corpus.",
+  "only_new": true,
+  "comment_quiet_hours": "Emails transmit only in [send_from, hold_start) local time; anything triggered outside is held (state/email_pending.json) and released at send_from by the session-runner. send_from doubles as the release time. --ignore-quiet-hours overrides; enabled=false disables.",
+  "quiet_hours": {
+   "enabled": true,
+   "send_from": "10:00",
+   "hold_start": "23:00"
   },
-  "public_sync": {
-    "comment": "After each successful private push, mirror ONLY the publishable subset (harness code + dashboard shell, never the AI/DS/ML/DL paper trees) to the PUBLIC repo agentic-research-advisor. Allowlist-first with a hard leak guard (scripts/public_sync.py). Active by default; set enabled=false to stop mirroring.",
-    "enabled": true
+  "provider": "gmail_smtp",
+  "smtp_host": "smtp.gmail.com",
+  "smtp_port": 587,
+  "username": "you@example.com",
+  "app_password": "",
+  "sendgrid_api_key": "",
+  "from_addr": "you@example.com",
+  "to_addr": "you@example.com"
+ },
+ "harvest": {
+  "comment_areas": "Free-text queries drive the keyword sources (Semantic Scholar/OpenAlex/Crossref). arXiv is driven by arxiv_categories instead: it sorts by submittedDate not relevance, so a bare term like 'Data Science' floods the corpus with off-topic physics/astro. Categories keep each area on-topic and disjoint.",
+  "areas": {
+   "AI": "artificial intelligence agents reasoning planning large language model alignment",
+   "DS": "data science statistical analysis tabular data feature engineering causal inference information retrieval",
+   "ML": "machine learning supervised learning generalization optimization model training benchmark",
+   "DL": "deep learning neural network transformer architecture representation learning computer vision"
   },
-  "email": {
-    "comment": "Optional. To receive daily reports, set enabled=true and provide a Gmail App Password OR a SendGrid API key. See SETUP.md.",
-    "enabled": false,
-    "comment_only_new": "When true, each run only emails papers not delivered before (tracked in state/emailed_ledger.json by paper slug). Run send_report.py --all to bypass and resend the whole corpus.",
-    "only_new": true,
-    "comment_quiet_hours": "Emails transmit only in [send_from, hold_start) local time; anything triggered outside is held (state/email_pending.json) and released at send_from by the session-runner. send_from doubles as the release time. --ignore-quiet-hours overrides; enabled=false disables.",
-    "quiet_hours": {
-      "enabled": true,
-      "send_from": "10:00",
-      "hold_start": "23:00"
-    },
-    "provider": "gmail_smtp",
-    "smtp_host": "smtp.gmail.com",
-    "smtp_port": 587,
-    "username": "you@example.com",
-    "app_password": "",
-    "sendgrid_api_key": "",
-    "from_addr": "you@example.com",
-    "to_addr": "you@example.com"
+  "arxiv_categories": {
+   "AI": [
+    "cs.AI",
+    "cs.CL",
+    "cs.MA"
+   ],
+   "DS": [
+    "stat.ME",
+    "stat.AP",
+    "cs.IR",
+    "cs.DB"
+   ],
+   "ML": [
+    "cs.LG",
+    "stat.ML"
+   ],
+   "DL": [
+    "cs.NE",
+    "cs.CV"
+   ]
   },
-  "harvest": {
-    "comment_areas": "Free-text queries drive the keyword sources (Semantic Scholar/OpenAlex/Crossref). arXiv is driven by arxiv_categories instead: it sorts by submittedDate not relevance, so a bare term like 'Data Science' floods the corpus with off-topic physics/astro. Categories keep each area on-topic and disjoint.",
-    "areas": {
-      "AI": "artificial intelligence agents reasoning planning large language model alignment",
-      "DS": "data science statistical analysis tabular data feature engineering causal inference information retrieval",
-      "ML": "machine learning supervised learning generalization optimization model training benchmark",
-      "DL": "deep learning neural network transformer architecture representation learning computer vision"
-    },
-    "arxiv_categories": {
-      "AI": ["cs.AI", "cs.CL", "cs.MA"],
-      "DS": ["stat.ME", "stat.AP", "cs.IR", "cs.DB"],
-      "ML": ["cs.LG", "stat.ML"],
-      "DL": ["cs.NE", "cs.CV"]
-    },
-    "area_folder_map": {
-      "AI": "AI",
-      "DS": "Data_Science",
-      "ML": "Machine_Learning",
-      "DL": "Deep_Learning"
-    },
-    "comment": "Relative paths are resolved against the repo root.",
-    "raw_research_dir": "AI_DS_ML_DL/raw/Research",
-    "top_k_per_day": 30,
-    "since_days": 35,
-    "comment_wiki_relevance": "Bias harvest selection toward papers relevant to the LLM knowledge wiki: added to rank_score as weight*relevance (0..1 TF-IDF cosine to the closest concept pages). Availability (downloadable PDF, 1000) still dominates, recency is 500; 400 makes relevance a strong tie-breaker. Set 0 to disable.",
-    "wiki_relevance_weight": 400.0,
-    "sources": ["semantic_scholar", "openalex", "arxiv", "crossref"],
-    "core_api_key": ""
+  "area_folder_map": {
+   "AI": "AI",
+   "DS": "Data_Science",
+   "ML": "Machine_Learning",
+   "DL": "Deep_Learning"
   },
-  "reproduce": {
-    "per_paper_minutes": 35,
-    "max_papers_per_day": 30,
-    "comment": "claude_exe: leave empty to use the CLAUDE_EXE env var or the first `claude` found on PATH.",
-    "claude_exe": "",
-    "comment_wiki_context_pages": "Top-K most relevant LLM-wiki concept pages injected as grounding context into each paper's reproduction prompt (0 disables).",
-    "wiki_context_pages": 5
+  "comment": "Relative paths are resolved against the repo root.",
+  "raw_research_dir": "AI_DS_ML_DL/raw/Research",
+  "top_k_per_day": 30,
+  "since_days": 35,
+  "comment_wiki_relevance": "Bias harvest selection toward papers relevant to the LLM knowledge wiki: added to rank_score as weight*relevance (0..1 TF-IDF cosine to the closest concept pages). Availability (downloadable PDF, 1000) still dominates, recency is 500; 400 makes relevance a strong tie-breaker. Set 0 to disable.",
+  "wiki_relevance_weight": 400.0,
+  "sources": [
+   "semantic_scholar",
+   "openalex",
+   "arxiv",
+   "crossref"
+  ],
+  "core_api_key": ""
+ },
+ "reproduce": {
+  "per_paper_minutes": 50,
+  "max_papers_per_day": 30,
+  "comment": "claude_exe: leave empty to use the CLAUDE_EXE env var or the first `claude` found on PATH.",
+  "claude_exe": "",
+  "comment_wiki_context_pages": "Top-K most relevant LLM-wiki concept pages injected as grounding context into each paper's reproduction prompt (0 disables).",
+  "wiki_context_pages": 5,
+  "comment_max_retries": "A retryable infra failure (usage/session limit, API 529, empty/timeout-no-output) re-attempts a paper up to this many times before it settles as EXHAUSTED_RETRIES; terminal outcomes and real reproductions are never retried.",
+  "max_retries": 3,
+  "comment_pacing": "Quota pacing so a cycle works WITH the account budget instead of bursting into the quota wall (see reproduce.py header). consecutive_limit_stop: stop the cycle after this many CONSECUTIVE papers hit a usage/session/API limit, 0 disables; un-attempted papers retry next cycle (outcome-based dedup does not burn them). min_seconds_between_calls: minimum wall-clock gap enforced between headless-claude spawns, 0 disables.",
+  "pacing": {
+   "consecutive_limit_stop": 2,
+   "min_seconds_between_calls": 15
   },
-  "paths": {
-    "comment": "All optional. python: empty = the interpreter running the scripts. repo_root: empty = the repo containing scripts/. wiki_project: empty = <repo_root>/AI_DS_ML_DL.",
-    "python": "",
-    "wiki_project": "",
-    "repo_root": ""
-  }
+  "comment_per_paper_minutes": "Raised 35->50 on 2026-07-17: 4 papers died at exactly the 35-min cap with substantial src/ written (TIMEOUT). Combined with continuation retries this gives a segmented budget of up to max_retries x 50 min per paper."
+ },
+ "paths": {
+  "comment": "All optional. python: empty = the interpreter running the scripts. repo_root: empty = the repo containing scripts/. wiki_project: empty = <repo_root>/AI_DS_ML_DL.",
+  "python": "",
+  "wiki_project": "",
+  "repo_root": ""
+ }
 }

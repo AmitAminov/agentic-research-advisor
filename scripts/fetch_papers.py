@@ -456,6 +456,11 @@ def harvest(config: dict[str, Any], top_month: int, top_recent: int,
     repo_root = pipeline_paths.repo_root(config)
     ledger = Ledger(repo_root / "state" / "processed_ledger.jsonl")
 
+    # Corpus PDFs are offloaded to the cloud (gdrive); pull just the small dedup
+    # state (analyzed_articles.pkl) locally so we still skip already-known titles
+    # without re-downloading the whole 10+ GB corpus. Best-effort (no-op if rclone
+    # or the remote is unavailable).
+    pipeline_paths.ensure_corpus_dedup_state(raw_research_dir, config)
     known_titles = already_known_titles(raw_research_dir, list(folder_map.values()))
     known_keys = ledger.load_keys()
     print(f"[harvest] {len(known_titles)} analyzed titles + {len(known_keys)} ledger keys "

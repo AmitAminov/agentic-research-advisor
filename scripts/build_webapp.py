@@ -79,12 +79,46 @@ AREAS = {"AI": "Artificial Intelligence", "DS": "Data Science",
 # DS uses sky blue (distinct from the cyan --accent2 used for links/buttons) so
 # area colour carries information on a DS-heavy corpus.
 AREA_COLORS = {"AI": "#A78BFA", "DS": "#38BDF8", "ML": "#34D399", "DL": "#FBBF24"}
+# PUBLISH FILTER (Amit directive 2026-07-17): only papers whose heuristic
+# reproducibility verdict is one of these appear on the website. Everything
+# else (minimal stubs, skipped, pending, failed) stays in state/ + on disk for
+# the pipeline's bookkeeping but is never published on the site.
+PUBLISH_VERDICTS = ("full", "partial")
 # glyphs used for gradient poster placeholders / hero accents
 AREA_GLYPHS = {"AI": "✶", "DS": "⬡", "ML": "△", "DL": "◈"}
 # Visitor-facing status labels — machine run_status values are for filtering only,
 # never shown raw ("timeout"/"completed"/"error" would scare a portfolio visitor).
 STATUS_LABEL = {"timeout": "pending", "completed": "reproduced",
                 "running": "in progress", "pending": "pending", "error": "pending"}
+
+# ---- frozen reproduction status vocabulary (Project Reproductions branch) ---- #
+# The 14-value UnifiedML reproduction vocabulary. A status is rendered ONLY when
+# one of these exact strings is present in a dossier artifact or the lab's
+# research/PILOT_REVIEW.md verdicts table -- never inferred, never upgraded.
+# Ordered so the most specific token wins a substring scan of free prose.
+REPRO_VOCAB = [
+    "EXACTLY_REPRODUCED", "STATISTICALLY_REPRODUCED", "FUNCTIONALLY_REPRODUCED",
+    "SKIPPED_SECURITY_POLICY",
+    "BLOCKED_BY_ENVIRONMENT", "BLOCKED_BY_HARDWARE", "BLOCKED_BY_LICENSE",
+    "BLOCKED_BY_SECURITY", "BLOCKED_BY_DATA",
+    "ATTEMPT_INTERRUPTED", "EXECUTION_ONLY", "NOT_REPRODUCED", "SUPERSEDED",
+    "EXECUTED",
+]
+# status -> traffic-light class shared with the paper pages (ok/warn/bad):
+#   reproduced strengths -> ok; honest partials (execution-only/interrupted) ->
+#   warn; blocked/skipped/not-reproduced -> bad (first-class, not a failure to hide).
+STATUS_BADGE_CLASS = {
+    "EXACTLY_REPRODUCED": "ok", "STATISTICALLY_REPRODUCED": "ok",
+    "FUNCTIONALLY_REPRODUCED": "ok",
+    "EXECUTED": "warn", "EXECUTION_ONLY": "warn", "ATTEMPT_INTERRUPTED": "warn",
+    "BLOCKED_BY_ENVIRONMENT": "bad", "BLOCKED_BY_HARDWARE": "bad",
+    "BLOCKED_BY_LICENSE": "bad", "BLOCKED_BY_SECURITY": "bad",
+    "BLOCKED_BY_DATA": "bad", "NOT_REPRODUCED": "bad", "SUPERSEDED": "bad",
+    "SKIPPED_SECURITY_POLICY": "bad",
+}
+# per-project accent colours (Project Reproductions cards/pages); cycled by
+# discovery order so the palette stays stable across nightly rebuilds.
+PROJECT_COLORS = ["#34E0E0", "#A78BFA", "#34D399", "#FBBF24", "#38BDF8", "#F472B6"]
 
 # Google Fonts + preconnect, shared across every emitted page.
 FONTS = (
@@ -463,8 +497,25 @@ def repro_verdict(p: dict[str, Any], metrics: Any) -> dict[str, Any]:
             "signals": signals, "claims": claim_items}
 
 
+def load_skiplist(repo: Path) -> dict[str, dict[str, Any]]:
+    """Load state/security_skiplist.json -> {slug: entry}. Never raises.
+
+    Any paper slug present here is a SKIPPED_SECURITY_POLICY reproduction: it must
+    render with the skip badge + reason and must NOT link to its original_data
+    (DOWNLOAD_SAFETY.md / supervisor malicious-download policy).
+    """
+    data = _load_json(repo / "state" / "security_skiplist.json")
+    out: dict[str, dict[str, Any]] = {}
+    if isinstance(data, dict):
+        for e in data.get("entries", []) or []:
+            if isinstance(e, dict) and e.get("slug"):
+                out[str(e["slug"])] = e
+    return out
+
+
 def discover(repo: Path, run_tests: bool, py_exe: str | None) -> list[dict[str, Any]]:
     progress = load_progress(repo)
+    skiplist = load_skiplist(repo)
     papers: list[dict[str, Any]] = []
     for code in AREAS:
         area_dir = repo / code
@@ -551,7 +602,51 @@ def discover(repo: Path, run_tests: bool, py_exe: str | None) -> list[dict[str, 
             except Exception:  # noqa: BLE001
                 rec["verdict"] = {"verdict": "minimal", "ratio": 0.0,
                                   "signals": [], "claims": []}
+
+            # Security skiplist override: a skipped paper is NEVER a reproduction.
+            # Drop the "produced" claim and any heuristic verdict, stamp the exact
+            # SKIPPED_SECURITY_POLICY status, and cut every original_data link.
+            skip = skiplist.get(d.name)
+            if skip:
+                rec["skip"] = skip
+                rec["produced"] = False
+                rec["status"] = "SKIPPED_SECURITY_POLICY"
+                rec["verdict"] = {"verdict": "skipped", "ratio": 0.0,
+                                  "signals": [], "claims": []}
+                rec["data_files"] = []
+                rec["data_dir"] = None
+                rec["data_src_md"] = None
             papers.append(rec)
+
+    # Durable security-skip records: a skiplisted slug must ALWAYS surface as
+    # SKIPPED_SECURITY_POLICY even if its paper directory was removed for security
+    # (e.g. an adversarial dataset tree deleted per DOWNLOAD_SAFETY.md). Never
+    # fabricates content — only the skiplist reason + the progress-log title.
+    seen = {p["slug"] for p in papers}
+    for slug, entry in skiplist.items():
+        if slug in seen:
+            continue
+        code = str(entry.get("area") or "AI")
+        if code not in AREAS:
+            code = "AI"
+        prog = progress.get(slug, {})
+        title = prog.get("title") or entry.get("title") or slug.replace("-", " ").title()
+        papers.append({
+            "code": code, "slug": slug, "dir": repo / code / slug, "title": title,
+            "meta": prog.get("meta", {}) or {},
+            "orig_pdf": None, "summary_pdf": None,
+            "orig_figs": [], "repro_figs": [], "orig_caps": {}, "repro_caps": {},
+            "metrics": None, "src": [], "src_root": None,
+            "tests": [], "tests_dir": None,
+            "tstat": {"ran": False, "passed": 0, "failed": 0, "errors": 0,
+                      "total": 0, "summary": ""},
+            "manim": [], "manim_dir": None,
+            "data_files": [], "data_dir": None, "data_src_md": None,
+            "notes": "", "notes_file": None,
+            "status": "SKIPPED_SECURITY_POLICY", "produced": False, "elapsed_s": None,
+            "verdict": {"verdict": "skipped", "ratio": 0.0, "signals": [], "claims": []},
+            "skip": entry, "ghost": True,
+        })
     return papers
 
 
@@ -991,7 +1086,31 @@ def render_paper(p: dict[str, Any], web: Path) -> Path:
         tab("Data", "data", False)
     )
 
+    # security skiplist: a skipped paper is not a reproduction — banner + no data link
+    skip = p.get("skip")
+    skip_banner = ""
+    if skip:
+        reason = str(skip.get("reason",
+                              "This reproduction was skipped for security reasons."))
+        bans = skip.get("bans") or []
+        bans_html = ("<ul>" + "".join(f"<li>{inline(str(b))}</li>" for b in bans)
+                     + "</ul>") if bans else ""
+        gh = skip.get("github_repo")
+        gh_html = (f'<p class="muted small">Upstream (deliberately not fetched): '
+                   f'<a href="{esc(str(gh))}" target="_blank" rel="noopener">'
+                   f'{esc(str(gh))} ↗</a></p>' if gh else "")
+        skip_banner = (
+            '<div class="skipbanner"><div class="skip-h">'
+            '<span class="sbadge bad lg">SKIPPED_SECURITY_POLICY</span></div>'
+            '<p><strong>This paper was not reproduced, by security policy — this is not a '
+            'reproduction failure.</strong></p>'
+            f'<p>{inline(reason)}</p>{bans_html}{gh_html}'
+            '<p class="muted small">Honored from <code>state/security_skiplist.json</code> '
+            '(DOWNLOAD_SAFETY.md / supervisor malicious-download policy). The original data '
+            'is intentionally not linked.</p></div>')
+
     overview = (
+        skip_banner +
         (abstract or "") +
         '<h3>Reproduction notes</h3>' + notes_html
     )
@@ -999,7 +1118,7 @@ def render_paper(p: dict[str, Any], web: Path) -> Path:
         p["orig_figs"][0] if p["orig_figs"] else None)
     panels = (
         panel("overview", True, overview) +
-        panel("analysis", False, render_analysis(p)) +
+        panel("analysis", False, skip_banner if skip else render_analysis(p)) +
         panel("summary", False, render_pdf(page, p["summary_pdf"], "summary.pdf")) +
         panel("paper", False, render_pdf(page, p["orig_pdf"], "Original paper PDF")) +
         panel("repro", False,
@@ -1018,17 +1137,27 @@ def render_paper(p: dict[str, Any], web: Path) -> Path:
         panel("source", False, render_tree(p["src_root"], page) if p["src_root"]
               else '<p class="muted">No src/ folder yet.</p>') +
         panel("tests", False, render_tests(p["tstat"], p["tests"], page)) +
-        panel("data", False, render_data(p["data_files"], p["data_dir"], p["data_src_md"], page))
+        panel("data", False,
+              ('<p class="muted">Original data is intentionally not shown for a '
+               'security-skipped reproduction.</p>' if skip
+               else render_data(p["data_files"], p["data_dir"], p["data_src_md"], page)))
     )
 
-    status_pill = "reproduced" if p["produced"] else \
-        esc(STATUS_LABEL.get(str(p["status"]), str(p["status"])))
-    dot = "ok" if p["produced"] else "warn"
-    vd = (p.get("verdict") or {}).get("verdict", "minimal")
-    vcls = VERDICT_CLASS.get(vd, "bad")
-    verdict_pill = (f'<a class="pill vpill {vcls}" href="#analysis" '
-                    f'data-goto="analysis"><span class="dot {vcls}"></span>'
-                    f'{esc(VERDICT_LABEL.get(vd, vd))}</a>')
+    if skip:
+        status_pill = "SKIPPED_SECURITY_POLICY"
+        status_cls = dot = "bad"
+        verdict_pill = ('<span class="pill bad"><span class="dot bad"></span>'
+                        'security policy</span>')
+    else:
+        status_pill = "reproduced" if p["produced"] else \
+            esc(STATUS_LABEL.get(str(p["status"]), str(p["status"])))
+        status_cls = "ok" if p["produced"] else "warn"
+        dot = status_cls
+        vd = (p.get("verdict") or {}).get("verdict", "minimal")
+        vcls = VERDICT_CLASS.get(vd, "bad")
+        verdict_pill = (f'<a class="pill vpill {vcls}" href="#analysis" '
+                        f'data-goto="analysis"><span class="dot {vcls}"></span>'
+                        f'{esc(VERDICT_LABEL.get(vd, vd))}</a>')
     doc = f"""<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>{esc(p['title'])} — {p['code']}</title>
@@ -1047,7 +1176,7 @@ def render_paper(p: dict[str, Any], web: Path) -> Path:
     {f'<div class="metaline">{metaline}</div>' if metaline else ''}
     {linkbar}
     <div class="pills">
-      <span class="pill {'ok' if p['produced'] else 'warn'}"><span class="dot {dot}"></span>{status_pill}</span>
+      <span class="pill {status_cls}"><span class="dot {dot}"></span>{status_pill}</span>
       {verdict_pill}
       <span class="pill muted">{len(p['orig_figs'])} original · {len(p['repro_figs'])} reproduced figs</span>
       <span class="pill muted">{len(p['tests'])} tests</span>
@@ -1077,10 +1206,11 @@ def render_paper(p: dict[str, Any], web: Path) -> Path:
 def render_card(p: dict[str, Any], web: Path, page: Path) -> str:
     idx = web / "index.html"
     color = AREA_COLORS[p["code"]]
+    skip = p.get("skip")
     thumb_src = None
-    if p["repro_figs"]:
+    if not skip and p["repro_figs"]:
         thumb_src = p["repro_figs"][0]
-    elif p["orig_figs"]:
+    elif not skip and p["orig_figs"]:
         thumb_src = p["orig_figs"][0]
     if thumb_src:
         thumb = (f'<img class="thumb" loading="lazy" decoding="async" '
@@ -1089,18 +1219,25 @@ def render_card(p: dict[str, Any], web: Path, page: Path) -> str:
         thumb = (f'<div class="thumb placeholder" style="--c:{color}">'
                  f'<span class="poster-glyph">{AREA_GLYPHS[p["code"]]}</span></div>')
     # raw machine value stays on data-status for filtering; label is humanized
-    status = "reproduced" if p["produced"] else str(p["status"] or "pending")
-    status_label = "reproduced" if p["produced"] else \
-        STATUS_LABEL.get(status, status)
+    if skip:
+        status = "SKIPPED_SECURITY_POLICY"
+        status_label = "skipped · security"
+    else:
+        status = "reproduced" if p["produced"] else str(p["status"] or "pending")
+        status_label = "reproduced" if p["produced"] else \
+            STATUS_LABEL.get(status, status)
     tstat = p["tstat"]
     tests_label = (f'{tstat["passed"]}/{tstat["total"]} tests' if tstat.get("ran") and tstat["total"]
                    else f'{len(p["tests"])} tests')
     has_anim = "yes" if p["manim"] else "no"
-    dot = "ok" if p["produced"] else "warn"
-    vd = (p.get("verdict") or {}).get("verdict", "minimal")
-    vcls = VERDICT_CLASS.get(vd, "bad")
-    verdict_chip = (f'<span class="vchip {vcls}" title="reproducibility verdict">'
-                    f'{esc(vd)}</span>')
+    dot = "bad" if skip else ("ok" if p["produced"] else "warn")
+    vd = "skipped" if skip else (p.get("verdict") or {}).get("verdict", "minimal")
+    if skip:
+        verdict_chip = '<span class="vchip bad" title="security policy">skipped</span>'
+    else:
+        vcls = VERDICT_CLASS.get(vd, "bad")
+        verdict_chip = (f'<span class="vchip {vcls}" title="reproducibility verdict">'
+                        f'{esc(vd)}</span>')
     flags = []
     if p["orig_pdf"]:
         flags.append("PDF")
@@ -1171,8 +1308,717 @@ HERO3D_JS = r"""/* Interactive neural-mesh sphere for the hero (Three.js from CD
 """
 
 
+# --------------------------------------------------------------------------- #
+# Project Reproductions branch (UnifiedML two-track protocol) — read-only
+#
+# Dossiers live under <unifiedml_root>/projects/<slug>/. A dir with a
+# REPRODUCTION_CONTRACT.md is a dossier. Everything below is best-effort and
+# wrapped by callers in try/except so a missing/renamed field degrades to
+# "not available" and NEVER fabricates or breaks the paper build.
+# --------------------------------------------------------------------------- #
+CONTRACT_KIND_LABEL = {
+    "functional": "Functional behavioral contract (§6.2)",
+    "metric": "Metric contract (numeric, frozen tolerance)",
+}
+# curated: keys too bulky/noisy to dump in the Track-B gate-metrics view.
+_TB_DROP = {"train_loss_per_epoch", "per_query", "retrieved_chunks", "live_local",
+            "advisory_model_based", "artifacts", "data_sha256", "final_train_loss",
+            "environment_version_matrix_finding"}
+
+
+def _vocab_status(text: Any) -> str | None:
+    """Return the first frozen-vocabulary status token found in free prose, else None.
+
+    Used only as a fallback when a dossier artifact carries no explicit status
+    field — e.g. reading the authoritative research/PILOT_REVIEW.md verdicts table.
+    Never invents a status: absence yields None (rendered as 'not recorded').
+    """
+    if not text:
+        return None
+    up = str(text).upper()
+    for v in REPRO_VOCAB:
+        if v in up:
+            return v
+    return None
+
+
+def status_badge(status: str | None, size: str = "lg") -> str:
+    if not status:
+        return '<span class="sbadge na">status not recorded</span>'
+    cls = STATUS_BADGE_CLASS.get(status, "bad")
+    return f'<span class="sbadge {cls} {esc(size)}">{esc(status)}</span>'
+
+
+def render_kv(pairs: list[tuple[str, str]]) -> str:
+    rows = "".join(f'<div class="kv-row"><span class="k">{esc(k)}</span>'
+                   f'<span class="v">{v}</span></div>' for k, v in pairs if v)
+    return f'<div class="kv">{rows}</div>' if rows else ""
+
+
+def _frontmatter(md: str) -> dict[str, str]:
+    """Parse a leading '--- ... ---' YAML-ish block into {key: value}. Never raises."""
+    fm: dict[str, str] = {}
+    try:
+        if not md.startswith("---"):
+            return fm
+        end = md.find("\n---", 3)
+        if end == -1:
+            return fm
+        for ln in md[3:end].splitlines():
+            if ":" in ln:
+                k, _, v = ln.partition(":")
+                fm[k.strip()] = v.strip()
+    except Exception:  # noqa: BLE001
+        return {}
+    return fm
+
+
+def _first_bullet(md: str) -> str:
+    for ln in md.splitlines():
+        s = ln.strip()
+        if s.startswith(("- ", "* ")):
+            return s[2:].strip()
+    return ""
+
+
+def find_unifiedml_root(repo: Path, override: str | Path | None = None) -> Path | None:
+    """Locate the UnifiedML repo root (the dir whose projects/ holds the dossiers).
+
+    Resolution order: explicit override -> $UNIFIEDML_ROOT -> config.json
+    paths.unifiedml_root -> sibling <repo>/../UnifiedML. Returns None if none has
+    a projects/ dir, so the branch degrades cleanly.
+    """
+    cands: list[Path] = []
+    if override:
+        cands.append(Path(override))
+    env = os.environ.get("UNIFIEDML_ROOT")
+    if env:
+        cands.append(Path(env))
+    cfg = _load_json(repo / "config.json")
+    if isinstance(cfg, dict):
+        p = (cfg.get("paths") or {}).get("unifiedml_root")
+        if p:
+            cands.append(Path(p))
+    cands.append(repo.parent / "UnifiedML")
+    for c in cands:
+        try:
+            if c and (c / "projects").is_dir():
+                return c
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+def load_pilot_verdicts(uml_root: Path | None) -> dict[str, dict[str, str]]:
+    """Parse research/PILOT_REVIEW.md 'Pilot execution verdicts' table.
+
+    Returns {slug: {"track_a":.., "track_b":.., "basis":..}} with markdown bold
+    stripped. This table is the authoritative status source; used to fill a
+    Track-B status/metrics when a dossier ships no normalized JSON. Never raises.
+    """
+    out: dict[str, dict[str, str]] = {}
+    if not uml_root:
+        return out
+    f = uml_root / "research" / "PILOT_REVIEW.md"
+    if not f.is_file():
+        return out
+    try:
+        lines = f.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:  # noqa: BLE001
+        return out
+
+    def _clean(s: str) -> str:
+        return s.replace("**", "").strip()
+
+    i = 0
+    n = len(lines)
+    while i < n:
+        ln = lines[i]
+        if "|" in ln and "Track A" in ln and "Track B" in ln:
+            # header found; skip the separator row and read data rows
+            i += 2
+            while i < n and "|" in lines[i] and lines[i].strip():
+                cells = _split_row(lines[i])
+                if len(cells) >= 4:
+                    slug = _clean(cells[0])
+                    if slug and slug.lower() != "pilot":
+                        out[slug] = {"track_a": _clean(cells[1]),
+                                     "track_b": _clean(cells[2]),
+                                     "basis": _clean(cells[3])}
+                i += 1
+            break
+        i += 1
+    return out
+
+
+def _project_metrics_view(tb: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in tb.items() if k not in _TB_DROP}
+
+
+def build_project_record(d: Path, verdicts: dict[str, dict[str, str]],
+                         color: str) -> dict[str, Any]:
+    """Assemble one project dossier into a render record. Best-effort throughout."""
+    slug = d.name
+    card_md = ""
+    for name in ("PROJECT_CARD.md", "README.md"):
+        f = d / name
+        if f.is_file():
+            card_md = f.read_text(encoding="utf-8", errors="replace")
+            break
+    # Merge frontmatter across the dossier's card files (first value wins). Some
+    # dossiers keep the pins in PROJECT_CARD.md frontmatter, others in
+    # RESULTS_SUMMARY.md / MODEL_CARD.md — merging keeps rendering uniform.
+    fm: dict[str, str] = {}
+    for name in ("PROJECT_CARD.md", "RESULTS_SUMMARY.md", "MODEL_CARD.md"):
+        f = d / name
+        if f.is_file():
+            for k, v in _frontmatter(f.read_text(encoding="utf-8", errors="replace")).items():
+                fm.setdefault(k, v)
+    upstream_full = fm.get("full_name") or ""
+    title = upstream_full or slug.replace("-", " ").title()
+    description = _first_bullet(card_md)
+    sha = fm.get("head_sha") or ""
+    license_ = fm.get("license") or ""
+    result_type = fm.get("result_type") or ""
+
+    ta = _load_json(d / "results" / "raw" / "track_a_reference_attempt.json")
+
+    tb = None
+    for cand in (d / "results" / "normalized" / "track_b_full.json",
+                 d / "results" / "normalized" / "track_b.json",
+                 d / "results" / "raw" / "live_local_run.json"):
+        data = _load_json(cand)
+        if isinstance(data, dict):
+            tb = data
+            break
+    if tb is None:  # last resort: any normalized/*.json that isn't a smoke stub
+        for cand in sorted((d / "results" / "normalized").glob("*.json")) \
+                if (d / "results" / "normalized").is_dir() else []:
+            if cand.name.endswith("smoke.json"):
+                continue
+            data = _load_json(cand)
+            if isinstance(data, dict):
+                tb = data
+                break
+
+    # modernized / adapted run (own callout — never a reproduction)
+    modernized: Any = None
+    if isinstance(tb, dict) and isinstance(tb.get("live_local"), dict):
+        modernized = tb["live_local"]
+    elif isinstance(ta, dict) and ta.get("adapted_track_note"):
+        modernized = ta["adapted_track_note"]
+
+    row = verdicts.get(slug, {})
+    ta_status = (ta or {}).get("status") or _vocab_status(row.get("track_a", ""))
+    tb_status = None
+    if isinstance(tb, dict):
+        tb_status = _vocab_status(tb.get("status_suggestion") or tb.get("status") or "")
+    if not tb_status:
+        tb_status = _vocab_status(row.get("track_b", ""))
+
+    if not sha:
+        sha = (ta or {}).get("upstream_commit") or ""
+    basis = ""
+    if isinstance(tb, dict):
+        basis = (tb.get("gate") or {}).get("basis", "") if isinstance(tb.get("gate"), dict) else ""
+        basis = basis or (tb.get("contract") or {}).get("source", "") if isinstance(tb.get("contract"), dict) else basis
+    basis = basis or row.get("basis", "")
+    tb_prose = "" if isinstance(tb, dict) else row.get("track_b", "")
+
+    upstream_url = ""
+    commit_url = ""
+    if "/" in upstream_full:
+        upstream_url = f"https://github.com/{upstream_full}"
+        if sha:
+            commit_url = f"{upstream_url}/tree/{sha}"
+
+    return {
+        "slug": slug, "dir": d, "title": title, "description": description,
+        "color": color, "upstream_full": upstream_full, "upstream_url": upstream_url,
+        "commit_url": commit_url, "sha": sha, "license": license_,
+        "result_type": result_type, "track_a": ta, "track_b": tb,
+        "ta_status": ta_status, "tb_status": tb_status, "basis": basis,
+        "tb_prose": tb_prose, "modernized": modernized, "row": row,
+    }
+
+
+def discover_projects(uml_root: Path | None,
+                      verdicts: dict[str, dict[str, str]]) -> list[dict[str, Any]]:
+    if not uml_root:
+        return []
+    proj_root = uml_root / "projects"
+    if not proj_root.is_dir():
+        return []
+    recs: list[dict[str, Any]] = []
+    idx = 0
+    for d in sorted(proj_root.iterdir()):
+        if not d.is_dir() or d.name.startswith("."):
+            continue
+        if not (d / "REPRODUCTION_CONTRACT.md").exists():
+            continue
+        try:
+            color = PROJECT_COLORS[idx % len(PROJECT_COLORS)]
+            recs.append(build_project_record(d, verdicts, color))
+            idx += 1
+        except Exception:  # noqa: BLE001 — one bad dossier never sinks the branch
+            continue
+    return recs
+
+
+def render_track_a(rec: dict[str, Any]) -> str:
+    ta = rec.get("track_a") or {}
+    parts = [
+        '<div class="track-h"><span class="track-tag">Via open-source tools · '
+        'faithful reference</span><span class="track-name">Track A</span></div>',
+        '<p class="track-lead muted small">The <strong>original</strong> repository at its '
+        'pinned commit, executed <strong>unmodified</strong> in a hardened sandbox. Its '
+        'result speaks for the original work — blocked / interrupted / execution-only '
+        'dispositions are first-class evidence, not failures.</p>',
+        status_badge(rec.get("ta_status")),
+    ]
+    why = []
+    for k in ("status_rationale", "summary", "not_blocked_reason"):
+        v = ta.get(k)
+        if v:
+            why.append(f"<p>{inline(str(v))}</p>")
+    if why:
+        parts.append('<h4 class="track-sub">Why this status</h4>' + "".join(why))
+
+    facts: list[tuple[str, str]] = []
+    for k, label in (("environment", "Environment"), ("command", "Run command"),
+                     ("data_provenance", "Data provenance"),
+                     ("upstream_commit", "Pinned upstream commit"),
+                     ("executed_at_utc", "Recorded (UTC)"),
+                     ("assessed_at_utc", "Recorded (UTC)")):
+        v = ta.get(k)
+        if v:
+            val = (f'<code class="sha">{esc(str(v))}</code>'
+                   if k == "upstream_commit" else inline(str(v)))
+            facts.append((label, val))
+    if facts:
+        parts.append('<h4 class="track-sub">Key facts</h4>' + render_kv(facts))
+
+    for k, label in (("result", "Faithful-run result"),
+                     ("environment_version_matrix_finding",
+                      "Environment / version-matrix finding")):
+        if isinstance(ta.get(k), (dict, list)):
+            parts.append(f'<details class="msec" open><summary>{esc(label)}</summary>'
+                         f'<div class="msec-body">{_render_node(ta[k], 0)}</div></details>')
+
+    if ta.get("next_action_on_operator_go_ahead"):
+        parts.append('<p class="muted small"><strong>Next action:</strong> '
+                     f'{inline(str(ta["next_action_on_operator_go_ahead"]))}</p>')
+    if ta.get("supersedes"):
+        parts.append('<details class="msec"><summary>Superseded records '
+                     '(kept, never deleted)</summary>'
+                     f'<div class="msec-body">{_render_node(ta["supersedes"], 0)}</div>'
+                     '</details>')
+    if not ta:
+        prose = (rec.get("row") or {}).get("track_a")
+        parts.append(f"<p>{inline(prose)}</p>" if prose else
+                     '<p class="muted">No Track A attempt record found in the dossier.</p>')
+    return '<section class="track a">' + "".join(parts) + "</section>"
+
+
+def render_track_b(rec: dict[str, Any]) -> str:
+    tb = rec.get("track_b")
+    parts = [
+        '<div class="track-h"><span class="track-tag">Via UnifiedML · clean-room '
+        'reimplementation</span><span class="track-name">Track B</span></div>',
+        '<p class="track-lead muted small">The method re-expressed on UnifiedML\'s own '
+        'APIs from the paper / README / source (never executed on the host, never copied). '
+        'Its result speaks for the framework.</p>',
+        status_badge(rec.get("tb_status")),
+    ]
+    kv: list[tuple[str, str]] = []
+    kind = CONTRACT_KIND_LABEL.get((rec.get("result_type") or "").lower())
+    if kind:
+        kv.append(("Contract kind", esc(kind)))
+    if rec.get("basis"):
+        kv.append(("Contract / gate basis", inline(str(rec["basis"]))))
+    if rec.get("sha"):
+        sha = str(rec["sha"])
+        short = sha[:12] + "…" if len(sha) > 12 else sha
+        sha_html = (f'<a href="{esc(rec["commit_url"])}" target="_blank" rel="noopener">'
+                    f'<code class="sha">{esc(short)}</code></a>'
+                    if rec.get("commit_url") else f'<code class="sha">{esc(sha)}</code>')
+        kv.append(("Pinned upstream SHA", sha_html))
+    if rec.get("license"):
+        kv.append(("License", esc(str(rec["license"]))))
+    if rec.get("upstream_full"):
+        kv.append(("Upstream repo",
+                   f'<a href="{esc(rec["upstream_url"])}" target="_blank" rel="noopener">'
+                   f'{esc(rec["upstream_full"])} ↗</a>' if rec.get("upstream_url")
+                   else esc(rec["upstream_full"])))
+    parts.append(render_kv(kv))
+
+    if isinstance(tb, dict):
+        parts.append('<h4 class="track-sub">Gate metrics (measured, from this dossier)</h4>'
+                     f'<div class="metrics">{_render_node(_project_metrics_view(tb), 0)}</div>')
+    elif rec.get("tb_prose"):
+        parts.append('<h4 class="track-sub">Gate result</h4>'
+                     f'<p>{inline(str(rec["tb_prose"]))}</p>'
+                     '<p class="muted small">Metrics quoted from '
+                     '<code>research/PILOT_REVIEW.md</code> (the authoritative verdicts '
+                     'table); this dossier snapshot ships no normalized Track&nbsp;B JSON.</p>')
+    else:
+        parts.append('<p class="muted">No Track B metrics recorded in the dossier.</p>')
+    return '<section class="track b">' + "".join(parts) + "</section>"
+
+
+def render_modernized(rec: dict[str, Any]) -> str:
+    mod = rec.get("modernized")
+    if not mod:
+        return ""
+    if isinstance(mod, str):
+        head = "Adapted run — NOT a faithful reproduction"
+        body = f"<p>{inline(mod)}</p>"
+    else:
+        head = "Modernized / equivalent engineering run — NOT a reproduction"
+        m = {k: v for k, v in mod.items() if k != "per_query"}
+        label = m.pop("label", "")
+        body = ((f"<p>{inline(str(label))}</p>" if label else "")
+                + f'<div class="metrics">{_render_node(m, 0)}</div>')
+    return ('<section class="modernized"><div class="mod-h">'
+            '<span class="mod-tag">Not a reproduction</span>'
+            f"<h3>{esc(head)}</h3></div>"
+            '<p class="muted small">Shown separately by protocol: modernized / adapted runs '
+            'may improve on the original and can corroborate the tracks, but they are '
+            'engineering — never presented as reproduction of the original result, and they '
+            'set no reproduction status.</p>' + body + "</section>")
+
+
+def branch_nav(page: Path, web: Path, active: str, include_projects: bool = True) -> str:
+    ph = rel(page, web / "index.html")
+    prh = rel(page, web / "projects" / "index.html")
+
+    def item(href: str, label: str, key: str) -> str:
+        cls = "branch active" if key == active else "branch"
+        aria = ' aria-current="page"' if key == active else ""
+        return f'<a class="{cls}" href="{esc(href)}"{aria}>{esc(label)}</a>'
+    items = item(ph, "Paper Reproductions", "papers")
+    if include_projects:
+        items += item(prh, "Project Reproductions", "projects")
+    return f'<nav class="branchnav" aria-label="site sections">{items}</nav>'
+
+
+def render_project_page(rec: dict[str, Any], web: Path) -> Path:
+    page = web / "projects" / f"{rec['slug']}.html"
+    color = rec["color"]
+    nav = branch_nav(page, web, "projects")
+    a_cls = STATUS_BADGE_CLASS.get(rec.get("ta_status") or "", "na")
+    b_cls = STATUS_BADGE_CLASS.get(rec.get("tb_status") or "", "na")
+    pills = (
+        f'<span class="pill {a_cls}"><span class="dot {a_cls}"></span>'
+        f'Track A · {esc(rec.get("ta_status") or "not recorded")}</span>'
+        f'<span class="pill {b_cls}"><span class="dot {b_cls}"></span>'
+        f'Track B · {esc(rec.get("tb_status") or "not recorded")}</span>'
+    )
+    desc = f'<div class="metaline">{inline(rec["description"])}</div>' if rec.get("description") else ""
+    tracks = f'<div class="tracks">{render_track_a(rec)}{render_track_b(rec)}</div>'
+    modern = render_modernized(rec)
+    intro = (
+        '<section class="panel proto-note"><h3>Two-track reproduction protocol</h3>'
+        '<p>This GitHub project is reproduced under UnifiedML\'s two-track protocol. The two '
+        'tracks are shown <strong>side by side and never conflated</strong>: '
+        '<strong>Track A</strong> runs the original code faithfully to speak for the original '
+        'work; <strong>Track B</strong> re-implements the method on the framework to speak for '
+        'the framework. A modernized / adapted run, when present, is boxed separately and is '
+        'never presented as a reproduction.</p></section>'
+    )
+    doc = f"""<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>{esc(rec['title'])} — Project Reproduction</title>
+<link rel="icon" type="image/svg+xml" href="../assets/favicon.svg?v=3">
+<link rel="icon" href="../assets/favicon.ico?v=3" sizes="any">
+<link rel="apple-touch-icon" href="../assets/apple-touch-icon.png?v=3">
+{FONTS}
+<link rel=stylesheet href="../assets/style.css"></head>
+<body class=paper>
+<div class="bg-grid" aria-hidden="true"></div>
+<header class="phead" style="--c:{color}">
+  <a href="index.html" class="back">← all projects</a>
+  {nav}
+  <div class="phead-band">
+    <span class="badge area" style="--c:{color}">◑ Project Reproduction</span>
+    <h1>{esc(rec['title'])}</h1>
+    {desc}
+    <div class="pills">{pills}</div>
+  </div>
+</header>
+<main class="pbody">
+  {intro}
+  <section class="panel">{tracks}</section>
+  {f'<section class="panel">{modern}</section>' if modern else ''}
+</main>
+</body></html>"""
+    page.write_text(doc, encoding="utf-8")
+    return page
+
+
+def render_project_card(rec: dict[str, Any], web: Path, page: Path) -> str:
+    idx = web / "projects" / "index.html"
+    color = rec["color"]
+    a_cls = STATUS_BADGE_CLASS.get(rec.get("ta_status") or "", "na")
+    b_cls = STATUS_BADGE_CLASS.get(rec.get("tb_status") or "", "na")
+    sha = str(rec.get("sha") or "")
+    sha_chip = (f'<span class="tick">{esc(sha[:7])}</span>' if sha else "")
+    mod_chip = '<span class="tick">+ modernized</span>' if rec.get("modernized") else ""
+    return (
+        f'<a class="card" style="--c:{color}" href="{rel(idx, page)}">'
+        f'<div class="thumb placeholder" style="--c:{color}">'
+        f'<span class="poster-glyph">◑</span>'
+        f'<span class="badge area" style="--c:{color}">◑ Project</span></div>'
+        f'<div class="cbody">'
+        f'<h3>{esc(rec["title"])}</h3>'
+        f'<div class="track-chips">'
+        f'<span class="sbadge {a_cls} sm">A · {esc(rec.get("ta_status") or "n/a")}</span>'
+        f'<span class="sbadge {b_cls} sm">B · {esc(rec.get("tb_status") or "n/a")}</span>'
+        f'</div>'
+        f'<div class="ticks">{sha_chip}{mod_chip}</div>'
+        f'</div></a>'
+    )
+
+
+def render_projects_index(recs: list[dict[str, Any]], web: Path,
+                          uml_root: Path | None) -> Path:
+    (web / "projects").mkdir(parents=True, exist_ok=True)
+    page = web / "projects" / "index.html"
+    nav = branch_nav(page, web, "projects")
+    if recs:
+        cards = "\n".join(render_project_card(r, web, web / "projects" / f"{r['slug']}.html")
+                          for r in recs)
+        grid = f'<div class="grid">{cards}</div>'
+    elif uml_root is None:
+        grid = ('<div class="empty-state"><h2>No project reproductions available</h2>'
+                '<p class="muted">The UnifiedML reproduction lab was not found on this host, '
+                'so the Project Reproductions branch is empty. The paper reproductions are '
+                'unaffected.</p></div>')
+    else:
+        grid = ('<div class="empty-state"><h2>No project reproductions available</h2>'
+                '<p class="muted">No project dossiers were discovered under the UnifiedML '
+                'lab yet.</p></div>')
+    n = len(recs)
+    doc = f"""<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Project Reproductions — Computational Observatory</title>
+<link rel="icon" type="image/svg+xml" href="../assets/favicon.svg?v=3">
+<link rel="icon" href="../assets/favicon.ico?v=3" sizes="any">
+<link rel="apple-touch-icon" href="../assets/apple-touch-icon.png?v=3">
+{FONTS}
+<link rel=stylesheet href="../assets/style.css"></head><body>
+<div class="bg-grid" aria-hidden="true"></div>
+<header class=hero>
+  <div class=eyebrow>Computational Observatory</div>
+  <h1 class=wordmark>Project Reproductions</h1>
+  <div class=tagline>GitHub projects reproduced under the UnifiedML two-track protocol</div>
+  {nav}
+  <div class=stats>
+    <div class="stat"><b>{n}</b><span>projects</span></div>
+    <div class="stat"><b>2</b><span>tracks each</span></div>
+  </div>
+</header>
+<div class=wrap>
+  <p class="muted proj-lead">Each project is reproduced twice and the two tracks are shown
+  side by side, never conflated: <strong>Track&nbsp;A</strong> runs the original repository
+  faithfully at a pinned commit (its honest blocked / interrupted / execution-only
+  dispositions included as first-class evidence), and <strong>Track&nbsp;B</strong>
+  re-implements the method on UnifiedML's own APIs with measured gate metrics. Modernized /
+  adapted runs are boxed separately and are never presented as reproductions.</p>
+  {grid}
+</div>
+</body></html>"""
+    page.write_text(doc, encoding="utf-8")
+    return page
+
+
+# --------------------------------------------------------------------------- #
+# aggregate pipeline stats (public-safe: counts only, no titles/content) +
+# the copyright policy page (Amit directive 2026-07-17, local<->public sync)
+# --------------------------------------------------------------------------- #
+
+def _slugify_title(title: str, max_len: int = 80) -> str:
+    """Mirror of reproduce.slugify (kept local so this module stays standalone)."""
+    s = re.sub(r"[^a-zA-Z0-9]+", "-", (title or "").strip().lower()).strip("-")
+    return (s[:max_len].strip("-")) or "paper"
+
+
+def pipeline_aggregates(repo: Path, papers_all: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate reproduction-pipeline counts by research area.
+
+    PUBLIC-SAFE by construction: only counts - no paper titles, no text, no
+    figures. Buckets per area:
+      * ``reproduced_full`` / ``reproduced_partial`` - published reproductions;
+      * ``in_progress``  - on disk with work under way / eligible for retry;
+      * ``failed``       - honest terminal failures (EXHAUSTED_RETRIES, ...);
+      * ``skipped``      - first-class policy/hardware/survey skips;
+      * ``queued``       - harvested but not yet attempted or settled.
+    Plus ``topics_wiki_concepts``: the number of concept pages in the LLM wiki
+    (the "topics covered" aggregate).
+    """
+    terminal_failed = {"EXHAUSTED_RETRIES", "NO_CODE", "NOT_A_REPRODUCIBLE_PROJECT"}
+    terminal_skipped = {"SKIPPED_SECURITY_POLICY", "INELIGIBLE_HARDWARE"}
+    buckets = ("reproduced_full", "reproduced_partial", "in_progress",
+               "failed", "skipped", "queued")
+    agg: dict[str, dict[str, int]] = {c: {b: 0 for b in buckets} for c in AREAS}
+    on_disk: set[str] = set()
+    for p in papers_all:
+        c = p["code"]
+        on_disk.add(p["slug"])
+        v = (p.get("verdict") or {}).get("verdict")
+        st = str(p.get("status") or "")
+        if v == "full":
+            agg[c]["reproduced_full"] += 1
+        elif v == "partial":
+            agg[c]["reproduced_partial"] += 1
+        elif v == "skipped" or st in terminal_skipped:
+            agg[c]["skipped"] += 1
+        elif st in terminal_failed:
+            agg[c]["failed"] += 1
+        else:
+            agg[c]["in_progress"] += 1
+
+    # settled slugs (never re-attempted) from the pipeline ledgers
+    settled: set[str] = set()
+    for name in ("processed_ledger.jsonl", "pruned_papers.jsonl"):
+        f = repo / "state" / name
+        if not f.exists():
+            continue
+        for ln in f.read_text(encoding="utf-8", errors="replace").splitlines():
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                slug = json.loads(ln).get("slug")
+            except Exception:  # noqa: BLE001
+                continue
+            if slug:
+                settled.add(slug)
+
+    seen: set[str] = set()
+    hdir = repo / "state" / "harvests"
+    if hdir.is_dir():
+        for hf in sorted(hdir.glob("harvest-*.json")):
+            data = _load_json(hf)
+            if not isinstance(data, dict):
+                continue
+            for rec in data.get("records", []) or []:
+                if rec.get("status") != "added":
+                    continue
+                slug = _slugify_title(rec.get("title", ""))
+                area = rec.get("area_code")
+                if area not in AREAS or slug in seen:
+                    continue
+                seen.add(slug)
+                if slug in on_disk or slug in settled:
+                    continue
+                agg[area]["queued"] += 1
+
+    topics = 0
+    cdir = repo / "AI_DS_ML_DL" / "wiki" / "concepts"
+    if cdir.is_dir():
+        topics = sum(1 for _ in cdir.glob("*.md"))
+
+    totals = {b: sum(agg[c][b] for c in AREAS) for b in buckets}
+    return {
+        "generated": datetime.now().isoformat(timespec="seconds"),
+        "by_area": agg, "totals": totals,
+        "topics_wiki_concepts": topics,
+        "definitions": {
+            "reproduced_full": "heuristic verdict 'full' - central claims confirmed with multiple independent signals",
+            "reproduced_partial": "heuristic verdict 'partial' - some headline results reproduced",
+            "in_progress": "harvested and being worked on / eligible for a bounded retry",
+            "failed": "honest terminal failure (retry budget exhausted or not a reproducible artifact)",
+            "skipped": "first-class policy skip (security policy / hardware envelope)",
+            "queued": "harvested, not yet attempted",
+        },
+    }
+
+
+COPYRIGHT_HTML_BODY = """
+<h2>Copyright &amp; content policy</h2>
+<p>This public dashboard publishes <strong>aggregate numbers only</strong> about a private
+research-reproduction pipeline covering Artificial Intelligence, Data Science, Machine
+Learning, and Deep Learning.</p>
+<ul>
+  <li><strong>No paper PDFs, no full paper text, and no publisher- or author-owned figures
+      are hosted here.</strong> Those artifacts live only in the private working corpus used
+      for the reproduction work itself.</li>
+  <li>The numbers shown (papers per area, reproduction outcomes, topic counts) are
+      <strong>facts about our own pipeline</strong> and contain no copyrighted expression.</li>
+  <li>Where individual works are ever referenced, they are referenced by
+      <strong>title and a link to the official source</strong> (e.g. the arXiv abstract page),
+      never by rehosted content.</li>
+  <li>All summaries, metrics, code, figures, and animations produced by this project are
+      <strong>original works of the pipeline</strong>, derived from our own reproduction runs;
+      reproduced figures are our re-computations, not copies of the originals.</li>
+  <li>Papers are harvested exclusively through official public APIs (arXiv, Semantic Scholar,
+      OpenAlex, Crossref) under their terms of service.</li>
+</ul>
+<p>If you believe any content here infringes your rights, contact
+<a href="mailto:mldsaidlagents@gmail.com">mldsaidlagents@gmail.com</a> and it will be
+reviewed and removed promptly.</p>
+"""
+
+
+def render_copyright_page(web: Path) -> Path:
+    """Write the standalone copyright / content-policy page."""
+    doc = f"""<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Copyright policy — Computational Observatory</title>
+<link rel="icon" type="image/svg+xml" href="assets/favicon.svg?v=3">
+{FONTS}
+<link rel=stylesheet href="assets/style.css"></head><body>
+<div class="bg-grid" aria-hidden="true"></div>
+<header class=hero>
+  <div class=eyebrow>Computational Observatory</div>
+  <h1 class=wordmark>Copyright Policy</h1>
+  <div class=tagline>What this public site does — and deliberately does not — host</div>
+</header>
+<div class=wrap>
+  <div class="empty-state" style="text-align:left">{COPYRIGHT_HTML_BODY}</div>
+  <p class="muted small"><a href="index.html">&larr; back to the dashboard</a></p>
+</div>
+</body></html>"""
+    page = web / "copyright.html"
+    page.write_text(doc, encoding="utf-8")
+    return page
+
+
+def render_public_aggregates(agg: dict[str, Any]) -> str:
+    """Aggregate-counts table for the PUBLIC shell page (counts only)."""
+    head = ("<tr><th>Area</th><th>Fully reproduced</th><th>Partially reproduced</th>"
+            "<th>In progress</th><th>Queued</th><th>Failed (honest)</th>"
+            "<th>Skipped (policy)</th></tr>")
+    rows = []
+    for c, name in AREAS.items():
+        a = agg["by_area"][c]
+        rows.append(
+            f'<tr><td style="--c:{AREA_COLORS[c]}"><b>{esc(name)}</b> ({c})</td>'
+            f'<td>{a["reproduced_full"]}</td><td>{a["reproduced_partial"]}</td>'
+            f'<td>{a["in_progress"]}</td><td>{a["queued"]}</td>'
+            f'<td>{a["failed"]}</td><td>{a["skipped"]}</td></tr>')
+    t = agg["totals"]
+    rows.append(
+        f'<tr><td><b>Total</b></td><td><b>{t["reproduced_full"]}</b></td>'
+        f'<td><b>{t["reproduced_partial"]}</b></td><td><b>{t["in_progress"]}</b></td>'
+        f'<td><b>{t["queued"]}</b></td><td><b>{t["failed"]}</b></td>'
+        f'<td><b>{t["skipped"]}</b></td></tr>')
+    return (
+        '<div class="empty-state"><h2>Reproduction pipeline — live aggregates</h2>'
+        '<p class="muted">Aggregate counts from the private reproduction pipeline. '
+        'The per-paper corpora (PDFs, figures, code, animations) are not redistributed '
+        'here — see the <a href="copyright.html">copyright policy</a>.</p>'
+        '<div style="overflow-x:auto"><table class="agg-table">'
+        f'{head}{"".join(rows)}</table></div>'
+        f'<p class="muted small">Knowledge-base topics distilled so far: '
+        f'<b>{agg["topics_wiki_concepts"]}</b> concept pages · updated '
+        f'{esc(agg["generated"])}</p></div>')
+
+
 def build(repo: Path, run_tests: bool = False, py_exe: str | None = None,
-          shell_only: bool = False, web_out: "Path | None" = None) -> Path:
+          shell_only: bool = False, web_out: "Path | None" = None,
+          unifiedml_root: "str | Path | None" = None) -> Path:
     # ``shell_only`` emits ONLY the public dashboard shell: the rebranded hero,
     # aggregate stats, and assets -- no per-paper cards, no papers/ detail pages,
     # and a status.json stripped of every per-paper title. public_sync.py uses it
@@ -1185,7 +2031,16 @@ def build(repo: Path, run_tests: bool = False, py_exe: str | None = None,
     (web / "assets").mkdir(parents=True, exist_ok=True)
     (web / "data").mkdir(parents=True, exist_ok=True)
 
-    papers = discover(repo, run_tests, py_exe)
+    # PUBLISH FILTER (Amit directive 2026-07-17): the website keeps ONLY fully
+    # or partially reproduced papers. Minimal/stub/skipped/pending papers stay
+    # on disk and in state/ for the pipeline's own bookkeeping (retry or an
+    # honest terminal failure), but they are NOT published on the site.
+    papers_all = discover(repo, run_tests, py_exe)
+    papers = [p for p in papers_all
+              if (p.get("verdict") or {}).get("verdict") in PUBLISH_VERDICTS]
+    n_unpublished = len(papers_all) - len(papers)
+    # aggregate pipeline stats (counts only - safe for the public shell)
+    pipe_agg = pipeline_aggregates(repo, papers_all)
 
     (web / "assets" / "style.css").write_text(CSS, encoding="utf-8")
     (web / "assets" / "app.js").write_text(JS, encoding="utf-8")
@@ -1255,12 +2110,13 @@ def build(repo: Path, run_tests: bool = False, py_exe: str | None = None,
                        f'<span class="chip-n">{cnt}</span></button>')
 
     if shell_only:
-        grid = (
+        grid = render_public_aggregates(pipe_agg) + (
             '<div class="empty-state"><h2>Public snapshot</h2>'
             '<p class="muted">This is the public code + dashboard snapshot of the harness. '
             'The per-paper reproductions (harvested PDFs, reproduced figures, tests, and Manim '
             'animations) live in the private corpus and are not redistributed here for copyright '
-            'reasons. The counts above are the live totals from the full run.</p></div>')
+            'reasons — see the <a href="copyright.html">copyright policy</a>. The counts above '
+            'are the live aggregate totals from the full run.</p></div>')
     else:
         grid = "\n".join(cards) or (
             '<div class="empty-state"><h2>No papers yet</h2>'
@@ -1268,17 +2124,53 @@ def build(repo: Path, run_tests: bool = False, py_exe: str | None = None,
             'reproduced papers. Re-run this generator after a harvest and each paper appears here '
             'with its original PDF, reproduced figures, tests, and Manim animation.</p></div>')
 
+    # The site publishes ONLY full/partial reproductions (PUBLISH_VERDICTS); the
+    # legend states how many pipeline papers are deliberately not shown.
+    unpublished_note = (
+        f'<span class="lg muted" title="minimal/stub, pending, failed and '
+        f'policy-skipped papers stay in the pipeline\'s private bookkeeping">'
+        f'{n_unpublished} more in the pipeline (not published)</span>'
+        if n_unpublished else '')
     legend = (
         '<div class="legend" aria-label="status legend">'
         '<span class="lg"><span class="dot ok"></span>reproduced</span>'
-        '<span class="lg"><span class="dot warn"></span>pending</span>'
         '<span class="lg-sep"></span>'
         f'<span class="lg vk full"><span class="vchip ok">full</span>{verdict_counts["full"]}</span>'
         f'<span class="lg vk partial"><span class="vchip warn">partial</span>{verdict_counts["partial"]}</span>'
-        f'<span class="lg vk minimal"><span class="vchip bad">minimal</span>{verdict_counts["minimal"]}</span>'
+        + unpublished_note +
         '</div>')
 
+    # --- Project Reproductions branch (best-effort; never breaks the paper build) ---
+    projects: list[dict[str, Any]] = []
+    uml_root: Path | None = None
+    try:
+        uml_root = find_unifiedml_root(repo, unifiedml_root)
+        verdicts = load_pilot_verdicts(uml_root)
+        projects = discover_projects(uml_root, verdicts)
+        if not shell_only:
+            proj_dir = web / "projects"
+            proj_dir.mkdir(parents=True, exist_ok=True)
+            keep = {f"{r['slug']}.html" for r in projects} | {"index.html"}
+            for old in proj_dir.glob("*.html"):
+                if old.name not in keep:
+                    old.unlink()
+            for r in projects:
+                render_project_page(r, web)
+            render_projects_index(projects, web, uml_root)
+    except Exception as exc:  # noqa: BLE001 — the paper site must always build
+        print(f"[webapp] project-reproductions branch skipped: {exc}")
+        projects = []
+    # guarantee the branch landing page exists so the nav link never 404s
+    if not shell_only and not (web / "projects" / "index.html").exists():
+        try:
+            render_projects_index(projects, web, uml_root)
+        except Exception:  # noqa: BLE001
+            pass
+    branchnav_html = branch_nav(web / "index.html", web, "papers",
+                                include_projects=not shell_only)
+
     idx_html = INDEX.replace("@@FONTS@@", FONTS) \
+                    .replace("@@BRANCHNAV@@", branchnav_html) \
                     .replace("@@STATS@@", stat_cells) \
                     .replace("@@AREACHIPS@@", area_chips) \
                     .replace("@@LEGEND@@", legend) \
@@ -1290,8 +2182,11 @@ def build(repo: Path, run_tests: bool = False, py_exe: str | None = None,
     status = {
         "generated": datetime.now().isoformat(timespec="seconds"),
         "total": len(papers), "reproduced": reproduced, "animated": with_anim,
+        "unpublished_in_pipeline": n_unpublished,
+        "publish_verdicts": list(PUBLISH_VERDICTS),
         "tests_passing": tests_passing, "by_area": counts,
         "by_verdict": verdict_counts,
+        "pipeline": pipe_agg,
         "papers": [] if shell_only else [{
             "id": f"{p['code']}-{p['slug']}", "code": p["code"], "title": p["title"],
             "produced": p["produced"], "status": p["status"],
@@ -1307,10 +2202,20 @@ def build(repo: Path, run_tests: bool = False, py_exe: str | None = None,
             "has_manim": bool(p["manim"]), "has_original_data": bool(p["data_dir"]),
         } for p in papers],
     }
+    status["projects_total"] = len(projects)
+    status["projects"] = [{
+        "slug": r["slug"], "title": r["title"],
+        "track_a_status": r.get("ta_status"), "track_b_status": r.get("tb_status"),
+        "has_modernized": bool(r.get("modernized")),
+    } for r in projects]
     (web / "data" / "status.json").write_text(json.dumps(status, indent=2), encoding="utf-8")
 
-    print(f"[webapp] {len(papers)} papers · {reproduced} reproduced · {with_anim} animated "
-          f"-> {web / 'index.html'}")
+    # copyright / content policy page (both modes; mandatory on the public shell)
+    render_copyright_page(web)
+
+    print(f"[webapp] {len(papers)} published (full/partial) of {len(papers_all)} on disk "
+          f"({n_unpublished} unpublished pipeline papers) · {reproduced} reproduced · "
+          f"{with_anim} animated · {len(projects)} project reproductions -> {web / 'index.html'}")
     return web / "index.html"
 
 
@@ -1710,8 +2615,76 @@ details.msec .msec-body{padding:2px 13px 12px}
 .lb-nav:hover,.lb-close:hover{border-color:var(--accent2);color:var(--accent2)}
 .lb-close{top:22px;right:22px;width:40px;height:40px;font-size:16px}
 
+/* ---------- branch nav (top-level sections: Papers vs Projects) ---------- */
+.branchnav{display:inline-flex;gap:6px;margin:22px auto 0;padding:6px;border:1px solid var(--line);
+  border-radius:999px;background:var(--glass);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px)}
+header.phead .branchnav{margin:14px 0 0}
+.branch{font-family:var(--mono);font-size:13px;padding:8px 18px;border-radius:999px;color:var(--muted);
+  transition:150ms ease;white-space:nowrap}
+.branch:hover{color:var(--ink)}
+.branch.active{color:#fff;background:linear-gradient(135deg,rgba(109,123,255,.9),rgba(52,224,224,.7));
+  box-shadow:0 4px 14px -4px rgba(109,123,255,.6)}
+.branch:focus-visible{outline:2px solid var(--accent2);outline-offset:2px}
+.proj-lead{max-width:82ch;margin:0 2px 22px;font-size:14px;line-height:1.7}
+
+/* ---------- two-track project layout ---------- */
+.tracks{display:grid;grid-template-columns:1fr 1fr;gap:18px;align-items:start}
+.track{background:var(--panel2);border:1px solid var(--line);border-radius:var(--r-lg);
+  padding:20px 22px;border-top:3px solid var(--line)}
+.track.a{border-top-color:var(--accent2)}
+.track.b{border-top-color:var(--accent)}
+.track-h{display:flex;flex-direction:column;gap:2px;margin-bottom:12px}
+.track-tag{font-family:var(--mono);font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--muted)}
+.track-name{font-family:var(--serif);font-size:20px;font-weight:700}
+.track-lead{margin:0 0 12px}
+.track-sub{font-family:var(--serif);font-size:14.5px;margin:16px 0 8px;color:var(--ink);font-weight:600}
+.track .metrics{margin-top:4px}
+.proto-note p{color:#cdd4e6}
+
+/* status badges (frozen 14-value reproduction vocabulary) */
+.sbadge{display:inline-flex;align-items:center;gap:6px;font-family:var(--mono);font-weight:600;
+  letter-spacing:.4px;border:1px solid var(--line);border-radius:var(--r-sm);padding:5px 11px;font-size:12px}
+.sbadge.lg{font-size:13.5px;padding:7px 14px}
+.sbadge.sm{font-size:10.5px;padding:3px 8px;letter-spacing:.2px}
+.sbadge.ok{color:var(--ok);border-color:rgba(52,211,153,.45);background:rgba(52,211,153,.1)}
+.sbadge.warn{color:var(--warn);border-color:rgba(251,191,36,.45);background:rgba(251,191,36,.1)}
+.sbadge.bad{color:var(--bad);border-color:rgba(248,113,113,.45);background:rgba(248,113,113,.1)}
+.sbadge.na{color:var(--muted)}
+.track-chips{display:flex;gap:6px;flex-wrap:wrap;margin-top:2px}
+
+/* key/value facts */
+.kv{display:flex;flex-direction:column;margin:8px 0 4px;border:1px solid var(--line);
+  border-radius:var(--r-md);overflow:hidden}
+.kv-row{display:grid;grid-template-columns:170px 1fr;gap:10px;padding:8px 12px;
+  border-bottom:1px solid var(--line);font-size:13px}
+.kv-row:last-child{border-bottom:0}
+.kv-row .k{color:var(--muted);font-family:var(--mono);font-size:11px;text-transform:uppercase;letter-spacing:.5px}
+.kv-row .v{color:#cdd4e6;word-break:break-word}
+.kv-row .v a{color:var(--accent2)}
+code.sha{font-size:.82em;word-break:break-all}
+
+/* modernized / adapted callout — visibly NOT a reproduction */
+.modernized{border:1px dashed var(--warn);border-radius:var(--r-lg);padding:18px 20px;
+  background:linear-gradient(180deg,rgba(251,191,36,.06),transparent 70%)}
+.mod-h{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:6px}
+.mod-h h3{margin:0;font-family:var(--serif);font-size:18px}
+.mod-tag{font-family:var(--mono);font-size:10.5px;font-weight:700;letter-spacing:1px;text-transform:uppercase;
+  color:var(--warn);border:1px solid rgba(251,191,36,.5);border-radius:var(--r-sm);padding:3px 9px;
+  background:rgba(251,191,36,.1)}
+
+/* security skiplist banner (paper page) */
+.skipbanner{border:1px solid rgba(248,113,113,.5);border-left:3px solid var(--bad);
+  border-radius:var(--r-md);padding:16px 18px;background:rgba(248,113,113,.06);margin-bottom:8px}
+.skip-h{margin-bottom:8px}
+.skipbanner p{color:#f2d2d2}
+.skipbanner ul{color:#f2d2d2;margin:8px 0;padding-left:20px}
+.skipbanner .muted{color:var(--muted)}
+
 @media(max-width:720px){
   .figrow{grid-template-columns:1fr}
+  .tracks{grid-template-columns:1fr}
+  .kv-row{grid-template-columns:1fr}
+  .branchnav{flex-wrap:wrap}
   .figrow::before,.figcell:nth-of-type(2){display:none}
   .figcell:nth-of-type(2){grid-column:1;display:flex}
   .hero,.wrap,.pbody,.tabs,header.phead{padding-left:18px;padding-right:18px}
@@ -1726,6 +2699,14 @@ details.msec .msec-body{padding:2px 13px 12px}
     transition-duration:.001ms!important}
   html{scroll-behavior:auto}
 }
+/* public shell: aggregate pipeline table (counts only) */
+.agg-table{width:100%;border-collapse:collapse;margin:14px 0;font-size:.92rem}
+.agg-table th,.agg-table td{padding:8px 12px;text-align:center;
+  border-bottom:1px solid rgba(148,163,184,.18)}
+.agg-table th{color:var(--muted,#94a3b8);font-weight:600;font-size:.8rem;
+  text-transform:uppercase;letter-spacing:.04em}
+.agg-table td:first-child{text-align:left}
+.agg-table tr:last-child td{border-bottom:none}
 """
 
 JS = r"""(function(){
@@ -1971,6 +2952,7 @@ INDEX = """<!doctype html><html lang=en><head><meta charset=utf-8>
   <div class="hero-orb" id="hero-orb" aria-hidden="true"><noscript><img src="assets/brand-emblem.png" alt="" width=110 height=110 style="border-radius:16px"></noscript></div>
   <h1 class=wordmark>Agentic AI Researcher</h1>
   <div class=tagline>Autonomous paper reproduction</div>
+  @@BRANCHNAV@@
   <div class=stats>@@STATS@@</div>
 </header>
 <div class=wrap>
@@ -2022,6 +3004,9 @@ def main() -> int:
                     help="emit only the public dashboard shell (no per-paper cards/pages or titles)")
     ap.add_argument("--web-out", type=Path, default=None,
                     help="write the webapp to this dir instead of <repo>/webapp (used by public_sync)")
+    ap.add_argument("--unifiedml-root", type=str, default=None,
+                    help="path to the UnifiedML lab root (default: $UNIFIEDML_ROOT, "
+                         "config.json paths.unifiedml_root, or the sibling ../UnifiedML)")
     args = ap.parse_args()
 
     repo = args.repo.resolve()
@@ -2031,7 +3016,8 @@ def main() -> int:
         py_exe = str(cand) if cand.exists() else sys.executable
 
     build(repo, run_tests=args.run_tests, py_exe=py_exe,
-          shell_only=args.shell_only, web_out=args.web_out)
+          shell_only=args.shell_only, web_out=args.web_out,
+          unifiedml_root=args.unifiedml_root)
     if args.serve:
         serve(repo, args.port)
     return 0

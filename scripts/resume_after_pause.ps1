@@ -3,11 +3,11 @@
 #
 #  Fired ONCE by the one-time scheduled task "ResearcherResume3Day" to
 #  undo the 2026-07-07 "cancel all runs for 3 days" pause. It:
-#    1. re-enables the WikiDailyResearcher scheduled task (02:30 daily
-#       daily_pipeline.ps1 path),
+#    1. re-enables the ResearcherWeeklyReproduction scheduled task (weekly
+#       Sunday 10:00 session_pipeline.ps1 path - Amit directive 2026-07-17),
 #    2. clears the session-runner stop flag,
-#    3. relaunches the session-runner.ps1 daemon (6h session_pipeline path;
-#       its own single-instance guard prevents duplicates),
+#    3. relaunches the session-runner.ps1 daemon (weekly Sunday @ 10:00
+#       session_pipeline path; its own single-instance guard prevents duplicates),
 #    4. removes its own one-time trigger task so it never fires again.
 #
 #  Idempotent and side-effect-safe: it starts schedulers, it does not run
@@ -23,9 +23,9 @@ function RLog($m){ ("{0}  {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $m) 
 
 RLog "RESUME START (undo 3-day pause)."
 
-# 1. re-enable the daily scheduled-task trigger path
-try { Enable-ScheduledTask -TaskName 'WikiDailyResearcher' -EA Stop | Out-Null; RLog "WikiDailyResearcher re-enabled." }
-catch { RLog "WikiDailyResearcher enable ERROR: $_" }
+# 1. re-enable the weekly scheduled-task trigger path
+try { Enable-ScheduledTask -TaskName 'ResearcherWeeklyReproduction' -EA Stop | Out-Null; RLog "ResearcherWeeklyReproduction re-enabled." }
+catch { RLog "ResearcherWeeklyReproduction enable ERROR: $_" }
 
 # 2. clear the stop flag (session-runner also clears it on startup)
 if (Test-Path $stop) { Remove-Item $stop -Force -EA SilentlyContinue; RLog "cleared session-runner.stop." }

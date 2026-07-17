@@ -74,3 +74,36 @@ def resolve_under_repo(value: str | Path, cfg: dict[str, Any] | None = None) -> 
     """Resolve a possibly-relative configured path against the repo root."""
     p = Path(value)
     return p if p.is_absolute() else repo_root(cfg) / p
+
+
+def ensure_corpus_dedup_state(raw_research_dir: Path, cfg: dict[str, Any] | None = None) -> bool:
+    """Hydrate the harvest dedup state from the cloud corpus on a local miss.
+
+    The paper corpus is offloaded to ``gdrive:AI_DS_ML_DL_Researcher/corpus`` (rclone
+    remote from ``RCLONE_REMOTE``, default ``gdrive``). Harvest only needs each area's
+    ``analyzed_articles.pkl`` to skip already-known titles — NOT the 10+ GB of PDFs —
+    so this pulls ONLY those small dedup files, preserving dedup continuity across
+    runs without re-filling local disk.
+
+    Best-effort: returns ``False`` (leaving the directory untouched) when rclone or
+    the remote is unavailable, so harvest still runs — it just cannot dedup against
+    history that round. Never raises.
+    """
+    import subprocess
+
+    rclone = os.environ.get("RCLONE_BIN") or shutil.which("rclone")
+    if not rclone:
+        return False
+    remote = os.environ.get("RCLONE_REMOTE", "gdrive")
+    src = f"{remote}:AI_DS_ML_DL_Researcher/corpus"
+    try:
+        raw_research_dir.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            [rclone, "copy", src, str(raw_research_dir),
+             "--include", "**/analyzed_articles.pkl",
+             "--checksum", "--transfers", "4", "--tpslimit", "10"],
+            check=True,
+        )
+    except Exception:  # noqa: BLE001 — best-effort hydration; harvest degrades gracefully
+        return False
+    return True

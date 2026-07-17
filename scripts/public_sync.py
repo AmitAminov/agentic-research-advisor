@@ -51,6 +51,11 @@ SKIP = {"scripts/secrets_helper.py"}
 # Managed dirs are wiped then rebuilt from the allowlist so deletions/renames
 # propagate. Root files are overwritten (not deleted). .git is never touched.
 MANAGED_DIRS = ["scripts", "tests", "webapp", ".github", "docs"]
+# PUBLIC-ONLY files preserved across the managed-dir wipe: these live only in
+# the public repo (hand-curated there) and must never be deleted by a sync.
+# pages.yml is the GitHub Pages deploy workflow for the public dashboard
+# (discovered nearly-deleted on 2026-07-17 - the wipe of .github dropped it).
+KEEP_PUBLIC = [".github/workflows/pages.yml"]
 # HARD leak guard: none of these may exist in the public tree before push.
 FORBIDDEN = ["AI", "DS", "ML", "DL", "AI_DS_ML_DL", "state", "logs",
              "webapp/papers", "config.json", "scripts/secrets_helper.py",
@@ -66,6 +71,25 @@ def _run(cmd, token=None, check=True):
         raise RuntimeError(f"cmd failed ({p.returncode}): {cmd[0]} {cmd[1] if len(cmd) > 1 else ''}\n"
                            f"{err.strip()[-600:]}")
     return p
+
+
+def _push_with_retry(authed: str, token: str, attempts: int = 4) -> None:
+    """Push HEAD -> public BRANCH, retrying transient 403 / secondary-rate-limit
+    blocks with exponential backoff (GitHub throttles bursts of pushes to a repo).
+    Never rotates identity/region to evade a block -- it only waits and retries."""
+    import time
+    last = ""
+    for i in range(attempts):
+        p = subprocess.run(["git", "-C", str(PUBLIC_ROOT), "push", authed, f"HEAD:{BRANCH}"],
+                           capture_output=True, text=True)
+        if p.returncode == 0:
+            return
+        last = (p.stderr or "").replace(token, "***").strip()
+        if i < attempts - 1:
+            wait = 30 * (2 ** i)
+            print(f"[public_sync] push blocked (attempt {i + 1}/{attempts}); backing off {wait}s...")
+            time.sleep(wait)
+    raise SystemExit(f"[public_sync] push failed after {attempts} attempts: {last[-300:]}")
 
 
 def _ensure_clone(token: str) -> None:
@@ -108,17 +132,35 @@ def main(argv=None) -> int:
     argv = argv if argv is not None else sys.argv[1:]
     dry = "--dry-run" in argv
 
-    token = get_secret("github-pat", env="GITHUB_TOKEN").strip()
+    # Secret Manager FIRST (2026-07-17): this host carries a stale GITHUB_TOKEN
+    # in the user/machine environment that GitHub 403s on push; env is only a
+    # fallback when SM/gcloud are unavailable (see github_sync._read_token).
+    try:
+        token = get_secret("github-pat", env=None).strip()
+    except Exception:  # noqa: BLE001
+        token = ""
+    if not token:
+        token = get_secret("github-pat", env="GITHUB_TOKEN").strip()
     if not token:
         raise SystemExit("[public_sync] empty github token")
 
     _ensure_clone(token)
 
-    # Wipe managed dirs, then re-materialize from the allowlist.
+    # Wipe managed dirs, then re-materialize from the allowlist - preserving
+    # the public-only KEEP_PUBLIC files (e.g. the Pages deploy workflow).
+    kept: dict[str, bytes] = {}
+    for rel in KEEP_PUBLIC:
+        f = PUBLIC_ROOT / rel
+        if f.is_file():
+            kept[rel] = f.read_bytes()
     for d in MANAGED_DIRS:
         tgt = PUBLIC_ROOT / d
         if tgt.exists():
             shutil.rmtree(tgt)
+    for rel, blob in kept.items():
+        dst = PUBLIC_ROOT / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(blob)
     allow = _resolve_allowlist()
     for rel in sorted(allow):
         src, dst = PRIVATE_ROOT / rel, PUBLIC_ROOT / rel
@@ -149,7 +191,7 @@ def main(argv=None) -> int:
     _run(["git", "-C", str(PUBLIC_ROOT), "commit", "-q", "-m",
           f"chore(public): sync publishable snapshot @ {head}"])
     authed = f"https://x-access-token:{token}@github.com/{PUBLIC_REPO}.git"
-    _run(["git", "-C", str(PUBLIC_ROOT), "push", authed, f"HEAD:{BRANCH}"], token=token)
+    _push_with_retry(authed, token)
     print(f"[public_sync] pushed public snapshot @ {head}.")
     return 0
 

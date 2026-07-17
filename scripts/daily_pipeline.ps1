@@ -1,5 +1,12 @@
 # =====================================================================
-#  DAILY RESEARCH PIPELINE  (run by Task Scheduler: WikiDailyResearcher)
+#  RESEARCH PIPELINE  (LEGACY/MANUAL entry point)
+#
+#  CADENCE NOTE (Amit directive 2026-07-17): reproduction runs are WEEKLY
+#  (Sunday 10:00 local). The scheduled entry point is session_pipeline.ps1,
+#  run by the ResearcherWeeklyReproduction task (see register_tasks.ps1);
+#  the old daily task WikiDailyResearcher was removed. This leaner script
+#  is kept for MANUAL runs only; it shares the same single-instance lock
+#  and ExpressVPN fail-closed guard as session_pipeline.ps1.
 #
 #  Order:
 #   0. (gate) only proceed once the hourly wiki backlog is fully drained
@@ -46,7 +53,7 @@ if (-not (Test-Path $cfg)) { Log "FATAL: config.json missing (copy config.exampl
 
 # ---- single-instance guard (SHARED with session_pipeline.ps1) --------
 #  Same lock file as session_pipeline so the two orchestrators can never
-#  overlap each other: the 02:30 daily firing while a ~4h session cycle is
+#  overlap each other: the 13:00 daily firing while a session cycle is
 #  still reproducing would double every provider's request rate (the
 #  2026-07-03 overload; NETWORK_ETIQUETTE.md rule 8). A lock whose PID is
 #  not a live powershell is stale (crashed cycle) and is reclaimed.
@@ -64,6 +71,12 @@ if (Test-Path $lockFile) {
 }
 "$PID" | Out-File -FilePath $lockFile -Encoding ascii -Force
 Log "single-instance lock claimed (pid=$PID, shared with session_pipeline)."
+
+# ---- heavy-dataset/model cleanup: RETIRED (cloud storage) ----
+#  Heavy datasets/models now live in the cloud registry (gdrive:ML_MODELS + per-project
+#  folders) and are pulled on demand; with ~5 TB of Drive, local disk is no longer a
+#  constraint, so the disk-hygiene sweep (cleanup_heavy_datasets.ps1) is retired here.
+#  The standalone ResearcherDatasetCleanup scheduled task is disabled. See docs/CLOUD_ASSETS.md.
 
 # ---- 0. gate ---------------------------------------------------------
 & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scripts "check_gate.ps1") -WikiProject $wiki | Tee-Object -Variable gateOut | Out-Null

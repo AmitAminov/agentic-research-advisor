@@ -48,6 +48,21 @@ Constraints honoured: Windows, CPU-only, Python 3.10 in the project .venv. The
 GitHub token (read from the environment for API search only) is NEVER printed,
 logged, or written to any file. config.json is read-only here.
 
+Quota pacing (Amit directive 2026-07-12) - the reproduction loop works WITH the
+account budget instead of bursting into the quota wall (the root cause of ~190
+burned papers, docs/FAILURE_ANALYSIS.md). Two knobs, under config
+``reproduce.pacing``:
+  * ``consecutive_limit_stop`` (default 2): after this many CONSECUTIVE papers
+    return a quota/limit outcome (BLOCKED_USAGE_LIMIT / BLOCKED_SESSION_LIMIT /
+    BLOCKED_API_OVERLOAD) the cycle STOPS gracefully; because dedup is
+    outcome-based the un-attempted papers are NOT burned and retry next cycle.
+    Set 0 to disable the circuit-breaker.
+  * ``min_seconds_between_calls`` (default 15): minimum wall-clock gap enforced
+    between successive headless-claude spawns so a cycle cannot machine-gun the
+    API. Set 0 to disable inter-spawn pacing.
+Concurrency is also lowered elsewhere (wiki parallel-ingest workers 4->2) so
+wiki-ingest and reproduction do not both draw heavy concurrent quota.
+
 Usage:
     python reproduce.py --config ../config.json                 # today's harvest
     python reproduce.py --config ../config.json --harvest 2026-06-30
@@ -63,6 +78,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -87,10 +103,289 @@ CANONICAL_SUBDIRS = (
 )
 
 # -----------------------------------------------------------------------------
+# run-status vocabulary (Amit directive 2026-07-12)
+# -----------------------------------------------------------------------------
+# Root-cause analysis (docs/FAILURE_ANALYSIS.md) showed the dominant failure was
+# NOT intrinsic paper difficulty but the harness itself: the headless `claude`
+# CLI returned an account usage/session limit / API 529 / empty output, produced
+# nothing, and the run was then recorded in the dedup ledger as "completed" -
+# permanently burning the paper so it was never retried. These statuses let the
+# harness (a) distinguish graceful, first-class terminal outcomes from (b)
+# retryable infrastructure failures that must NOT burn the paper, and (c) cheap
+# pre-screen skips - and let downstream (webapp/digest/QA) read them as plain
+# strings without breaking.
+#
+# Terminal, produced a real reproduction:
+STATUS_REPRODUCED = "reproduced"
+# Genuine attempt finished but the artifact contract was not met. RETRYABLE as
+# of 2026-07-17 (Amit directive - failure investigation): a "minimal" outcome is
+# re-attempted with a continuation prompt (bounded by reproduce.max_retries) and
+# then settled honestly as EXHAUSTED_RETRIES; it is never published as done.
+STATUS_COMPLETED_MINIMAL = "completed-minimal"
+# Terminal, first-class non-failure skips:
+STATUS_SKIPPED_SECURITY = "SKIPPED_SECURITY_POLICY"
+STATUS_INELIGIBLE_HARDWARE = "INELIGIBLE_HARDWARE"
+STATUS_NOT_REPRODUCIBLE = "NOT_A_REPRODUCIBLE_PROJECT"
+STATUS_NO_CODE = "NO_CODE"
+STATUS_EXHAUSTED = "EXHAUSTED_RETRIES"
+# Retryable infrastructure / transient failures (do NOT burn the paper):
+STATUS_BLOCKED_USAGE = "BLOCKED_USAGE_LIMIT"
+STATUS_BLOCKED_SESSION = "BLOCKED_SESSION_LIMIT"
+STATUS_BLOCKED_API = "BLOCKED_API_OVERLOAD"
+STATUS_EMPTY_OUTPUT = "EMPTY_OUTPUT"
+STATUS_TIMEOUT_NO_OUTPUT = "TIMEOUT_NO_OUTPUT"
+# Timeout that left real partial artifacts on disk (src/ code, partial results):
+# retryable, and the retry runs with a CONTINUATION note so the next attempt
+# finishes the work instead of restarting - a segmented budget across attempts
+# (2026-07-17 fix: 4 of the 15 stub papers died at exactly the 35-min cap with
+# substantial src/ already written, labelled TIMEOUT_NO_OUTPUT).
+STATUS_TIMEOUT_PARTIAL = "TIMEOUT_PARTIAL_OUTPUT"
+STATUS_CLAUDE_NOT_FOUND = "claude-not-found"
+STATUS_HARNESS_ERROR = "harness-error"
+
+# Statuses that mean "this paper is settled - do not auto-retry it" even without
+# a produced reproduction. (A produced==True record is always terminal too.)
+# NOTE (2026-07-17): STATUS_COMPLETED_MINIMAL was REMOVED from this set - a
+# minimal attempt is now retryable (bounded), then settles as EXHAUSTED_RETRIES.
+TERMINAL_NONPRODUCED_STATUSES = frozenset({
+    STATUS_SKIPPED_SECURITY, STATUS_INELIGIBLE_HARDWARE,
+    STATUS_NOT_REPRODUCIBLE, STATUS_NO_CODE, STATUS_EXHAUSTED,
+})
+# Retryable statuses: an infra/transient failure OR an honest-but-insufficient
+# attempt; re-attempt on a future run (bounded by reproduce.max_retries so a
+# genuinely hard paper cannot loop forever - it settles as EXHAUSTED_RETRIES).
+RETRYABLE_STATUSES = frozenset({
+    STATUS_BLOCKED_USAGE, STATUS_BLOCKED_SESSION, STATUS_BLOCKED_API,
+    STATUS_EMPTY_OUTPUT, STATUS_TIMEOUT_NO_OUTPUT, STATUS_TIMEOUT_PARTIAL,
+    STATUS_COMPLETED_MINIMAL, STATUS_CLAUDE_NOT_FOUND,
+    STATUS_HARNESS_ERROR, "timeout",
+})
+
+# -----------------------------------------------------------------------------
+# quota pacing (Amit directive 2026-07-12) - live within the account budget
+# -----------------------------------------------------------------------------
+# The dominant historical failure (docs/FAILURE_ANALYSIS.md) was a cycle firing
+# many headless-claude spawns that ALL slammed into the account quota wall in a
+# burst, burning ~190 papers. The knobs below (config reproduce.pacing.*) make a
+# cycle pace itself so it works WITH the budget instead of exhausting it. See the
+# module docstring for the config schema.
+#
+# Account quota/session/API-limit statuses; K consecutive of these trip the
+# circuit-breaker (they are also a strict subset of RETRYABLE_STATUSES, so a
+# tripped cycle leaves every un-attempted paper eligible for the next cycle).
+QUOTA_LIMIT_STATUSES = frozenset({
+    STATUS_BLOCKED_USAGE, STATUS_BLOCKED_SESSION, STATUS_BLOCKED_API,
+})
+
+# Pacing defaults (used when config omits reproduce.pacing.*):
+DEFAULT_CONSECUTIVE_LIMIT_STOP = 2
+DEFAULT_MIN_SECONDS_BETWEEN_CALLS = 15.0
+
+
+def is_quota_limit(status: str | None) -> bool:
+    """True if a run status is an account quota / session / API-limit wall."""
+    return status in QUOTA_LIMIT_STATUSES
+
+
+def update_quota_streak(status: str | None, streak: int) -> int:
+    """Advance the consecutive-quota-limit streak given the latest run status.
+
+    Returns ``streak + 1`` for a quota/limit outcome, else resets to 0. Pure (no
+    I/O) so the circuit-breaker decision is unit-testable offline.
+    """
+    return streak + 1 if status in QUOTA_LIMIT_STATUSES else 0
+
+
+def quota_circuit_tripped(streak: int, threshold: int) -> bool:
+    """Whether ``streak`` consecutive quota-limit outcomes should stop the cycle.
+
+    ``threshold <= 0`` disables the circuit-breaker (never trips).
+    """
+    return threshold > 0 and streak >= threshold
+
+
+class SpawnPacer:
+    """Enforce a minimum wall-clock gap between successive claude spawns.
+
+    Call :meth:`wait` immediately before each claude spawn; it sleeps only the
+    remaining time needed so consecutive spawns are at least ``min_seconds``
+    apart, and never sleeps before the first spawn. ``sleep`` and ``clock`` are
+    injectable so the pacing is fully unit-testable without real waiting.
+
+    Parameters
+    ----------
+    min_seconds : float
+        Minimum gap between spawns (``<= 0`` disables pacing).
+    sleep : callable, optional
+        ``sleep(seconds)`` function (default :func:`time.sleep`).
+    clock : callable, optional
+        Monotonic clock returning seconds (default :func:`time.monotonic`).
+    """
+
+    def __init__(self, min_seconds: float,
+                 sleep=time.sleep, clock=time.monotonic) -> None:
+        self.min_seconds = max(0.0, float(min_seconds))
+        self._sleep = sleep
+        self._clock = clock
+        self._last: float | None = None
+
+    def wait(self) -> float:
+        """Sleep as needed before the next spawn; return the seconds slept."""
+        slept = 0.0
+        if self._last is not None and self.min_seconds > 0.0:
+            remaining = self.min_seconds - (self._clock() - self._last)
+            if remaining > 0.0:
+                self._sleep(remaining)
+                slept = remaining
+        self._last = self._clock()
+        return slept
+
+
+# A genuine reproduction attempt (read paper, clone/inspect, write code, run it)
+# cannot finish in under this many seconds. A "completed" run faster than this
+# with no artifacts is an infrastructure fast-fail (e.g. an account-limit
+# message the signature list does not know yet) - retryable, never terminal.
+# Evidence: 2026-07-15, 8 papers burned in 8-15 s each by the then-unknown
+# "You've hit your weekly limit" message (docs/FAILURE_ANALYSIS.md addendum).
+FAST_FAIL_SECONDS = 60
+
+
+def classify_run_outcome(log_text: str, run_status: str, produced: bool,
+                         skip_status: str | None = None,
+                         elapsed_s: float | None = None,
+                         partial_output: bool = False) -> str:
+    """Map a finished claude run to a status from the vocabulary above.
+
+    Parameters
+    ----------
+    log_text : str
+        The full text captured from the headless claude run (may be empty).
+    run_status : str
+        The raw status from :func:`run_claude` ("completed" / "timeout" /
+        "claude-not-found").
+    produced : bool
+        Whether the run met the reproduction artifact contract
+        (:func:`meets_reproduction_contract`).
+    skip_status : str, optional
+        A terminal skip already determined from a skip file / pre-screen; takes
+        precedence over everything else.
+    elapsed_s : float, optional
+        Wall-clock seconds of the claude run. A "completed" run faster than
+        ``FAST_FAIL_SECONDS`` with nothing produced is classified as a
+        retryable fast-fail (unknown infra/limit message), never as a terminal
+        attempt.
+    partial_output : bool, optional
+        Whether the run left real partial artifacts on disk (own src code or
+        reproduced outputs). Distinguishes TIMEOUT_PARTIAL_OUTPUT (continue
+        next attempt) from TIMEOUT_NO_OUTPUT.
+
+    Returns
+    -------
+    str
+        One status from the vocabulary. Retryable infra failures are detected
+        from the log signatures observed across the corpus so a doomed run does
+        not masquerade as a genuine "completed" attempt.
+    """
+    if skip_status:
+        return skip_status
+    if run_status == "claude-not-found":
+        return STATUS_CLAUDE_NOT_FOUND
+    low = (log_text or "").lower()
+    # infra signatures (account-level, transient) - retryable
+    if "session limit" in low or "hit your session" in low:
+        return STATUS_BLOCKED_SESSION
+    # Account usage/credit/plan-window limits. "hit your ... limit" catches the
+    # whole family (weekly/5-hour/opus/...): on 2026-07-15 the then-unmatched
+    # "You've hit your weekly limit - resets Jul 17" burned 8 papers as
+    # terminal completed-minimal in 8-15 s each.
+    if "usage-credits" in low or ("reached your" in low and "limit" in low) \
+            or ("hit your" in low and "limit" in low) \
+            or ("fable" in low and "limit" in low):
+        return STATUS_BLOCKED_USAGE
+    if "529 overloaded" in low or "api error: 529" in low or "overloaded_error" in low:
+        return STATUS_BLOCKED_API
+    if produced:
+        return STATUS_REPRODUCED
+    if run_status == "timeout":
+        return STATUS_TIMEOUT_PARTIAL if partial_output else STATUS_TIMEOUT_NO_OUTPUT
+    if not (log_text or "").strip():
+        return STATUS_EMPTY_OUTPUT
+    # Fast-fail guard: "completed" in under a minute with nothing produced is
+    # not a genuine attempt - it is an unrecognized infra/limit failure. Keep it
+    # retryable so a new limit message can never silently burn papers again.
+    if elapsed_s is not None and elapsed_s < FAST_FAIL_SECONDS:
+        return STATUS_EMPTY_OUTPUT
+    # ran to its own completion with real output on the transcript but the
+    # artifact contract was not met - an honest minimal attempt (retryable,
+    # bounded by max_retries, then settled as EXHAUSTED_RETRIES).
+    return STATUS_COMPLETED_MINIMAL
+
+
+def read_skip_status(paper_dir: Path, skiplist_slugs: set[str] | None = None) -> str | None:
+    """Terminal skip determined from files the agent wrote, or the skiplist.
+
+    The reproduction prompt instructs claude to write
+    ``reproduced_results/SECURITY_SKIP.txt`` (content "SKIPPED_SECURITY_POLICY")
+    or ``reproduced_results/HARDWARE_SKIP.txt`` ("INELIGIBLE_HARDWARE") when it
+    detects an adversarial-security corpus or a hardware-infeasible paper. Those
+    are first-class terminal non-failures - surface them here so the run record
+    reflects them instead of a misleading score-0 "minimal".
+    """
+    slug = paper_dir.name
+    if skiplist_slugs and slug in skiplist_slugs:
+        return STATUS_SKIPPED_SECURITY
+    rr = paper_dir / "reproduced_results"
+    if (rr / "SECURITY_SKIP.txt").exists():
+        return STATUS_SKIPPED_SECURITY
+    if (rr / "HARDWARE_SKIP.txt").exists():
+        return STATUS_INELIGIBLE_HARDWARE
+    if (paper_dir / "NOT_REPRODUCIBLE.txt").exists():
+        return STATUS_NOT_REPRODUCIBLE
+    return None
+
+
+# Conservative pre-screen keyword gates (only skip on STRONG signals; a normal
+# robustness/efficiency paper must NOT be skipped). Security tokens mirror
+# DOWNLOAD_SAFETY.md's detection words; a security skip is never a failure.
+_SEC_TOKENS = re.compile(
+    r"\b(prompt[- ]injection|jailbreak(ing)?|backdoor|malware|red[- ]team|"
+    r"exploit\s+(generation|payload)|cve-\d|audit\s+fixture)\b", re.I)
+_SURVEY_TOKENS = re.compile(
+    r"\b(this\s+(survey|review)|a\s+survey\s+of|we\s+survey|systematic\s+review|"
+    r"literature\s+review|is\s+a\s+position\s+paper|survey\s+paper)\b", re.I)
+_HW_STRONG = re.compile(
+    r"\b(\d{2,4}\s*[x×]\s*(a100|h100|v100|tpu)|"
+    r"\b(64|128|256|512|1024)\s+gpus?|"
+    r"\b(7|8|13|30|34|65|70|175|405)\s*b\b.*\bfrom\s+scratch|"
+    r"pre[- ]?train(ing|ed)?\s+(a\s+)?(large\s+)?(language\s+)?model)\b", re.I)
+
+
+def pre_screen(title: str, md_text: str, cfg: dict[str, Any] | None = None) -> str | None:
+    """Cheap, conservative pre-flight check BEFORE spawning claude.
+
+    Returns a terminal status (skip claude entirely) or None (proceed). Only the
+    strongest, low-false-positive signals trigger a skip; everything ambiguous
+    defers to the in-prompt SECURITY/HARDWARE gates and the agent's judgement.
+    """
+    if cfg is not None and not cfg.get("reproduce", {}).get("prescreen", True):
+        return None
+    hay = f"{title or ''}\n{(md_text or '')[:4000]}"
+    if _SEC_TOKENS.search(hay):
+        return STATUS_SKIPPED_SECURITY
+    head = f"{title or ''}\n{(md_text or '')[:1800]}"
+    if _SURVEY_TOKENS.search(head):
+        return STATUS_NOT_REPRODUCIBLE
+    if _HW_STRONG.search((md_text or "")[:6000]):
+        return STATUS_INELIGIBLE_HARDWARE
+    return None
+
+# -----------------------------------------------------------------------------
 # the reproduction prompt handed to the headless claude CLI
 # -----------------------------------------------------------------------------
 PROMPT_TEMPLATE = """You are reproducing a published research paper. Work tirelessly and fully autonomously; never ask questions; never stop early. Everything you write must actually RUN.
 If the `ml_ultracode` skill is available, invoke it first and follow its workflow (data-first inspection, explicit metrics, baseline, leakage-safe pipelines, multi-seed validation, honest reporting).
+SECURITY GATE (binding, C:\\Users\\ADMIN\\Agentic_Projects\\DOWNLOAD_SAFETY.md): STOP IMMEDIATELY and write reproduced_results/SECURITY_SKIP.txt containing exactly "SKIPPED_SECURITY_POLICY" plus the reason, then end, IF this paper is a security / prompt-injection / malware / exploit / red-team / backdoor benchmark or otherwise ships adversarial payloads or audit fixtures (detect from the title/paper.md/repo: "injection", "backdoor", "exploit", "malware", "jailbreak", "red-team", "audit" fixtures, CVE payloads). Do NOT clone, extract, execute, or reconstruct such content — a skip is NOT a failure. For any download you DO make: official source + pinned commit/version only; never load a third-party pickle/joblib/model-binary with full unpickling (weights_only=True or don't load); if antivirus flags anything, STOP and report — never disable it or bypass a quarantine.
+HARDWARE GATE (binding, C:\\Users\\ADMIN\\Agentic_Projects\\HARDWARE_ENVELOPE.md): This host is SMALL — 6 GB GPU VRAM (RTX 3060), ~24 GB usable RAM, 4C/8T CPU, keep disk small. BEFORE downloading data/weights, assess this paper's hardware needs from paper.md + the repo. If the faithful result REQUIRES anything beyond the envelope — GPU >6 GB VRAM (e.g. LLMs >=7B even 4-bit, large diffusion/ViT/video), multi-GPU, CUDA-scale training-from-scratch (NAS/pretraining/large RL), >~24 GB RAM working set, or >~20-30 GB of required downloads — and it CANNOT be scaled down while staying faithful to the method, then STOP: write reproduced_results/HARDWARE_SKIP.txt containing exactly "INELIGIBLE_HARDWARE" plus the specific limit exceeded, and end. Do NOT download multi-GB artifacts or start a run you cannot finish — that is what fills the disk and wastes the budget. A faithful scale-down (fewer epochs/params, a small public/synthetic stand-in) is PREFERRED when it stays true to the method; use it instead of skipping whenever possible, and document the deviation. Only skip as INELIGIBLE_HARDWARE when no faithful small version exists (the claim itself is the large-scale result). A hardware skip is NOT a reproduction failure.
 
 PAPER: {title}
 AREA: {area}
@@ -188,8 +483,179 @@ def _load_jsonl_slugs(path: Path) -> set[str]:
 
 
 def already_processed(ledger_path: Path, progress_path: Path) -> set[str]:
-    """Dedup keys: union of the processed ledger and the progress log."""
+    """Dedup keys: union of the processed ledger and the progress log.
+
+    Legacy helper (presence-based). New callers should use
+    :func:`compute_done_slugs`, which dedups on OUTCOME so an infra-killed run
+    does not permanently burn a paper.
+    """
     return _load_jsonl_slugs(ledger_path) | _load_jsonl_slugs(progress_path)
+
+
+def _iter_jsonl(path: Path):
+    if not path.exists():
+        return
+    for ln in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            yield json.loads(ln)
+        except Exception:  # noqa: BLE001
+            continue
+
+
+def load_requeued(path: Path) -> dict[str, str]:
+    """Map slug -> cutoff date for re-queued papers (state/requeued_papers.jsonl).
+
+    A re-queued paper's runs recorded on or before its cutoff date are FORGIVEN
+    by :func:`compute_done_slugs`, making it eligible for a fresh attempt while
+    every other pruned/terminal paper stays settled. Later cutoff wins if a slug
+    is listed twice. Missing file -> empty map (no-op). See the Amit directive
+    2026-07-12 re-queue of the 16 code-only papers (docs/FAILURE_ANALYSIS.md).
+    """
+    out: dict[str, str] = {}
+    for obj in _iter_jsonl(path):
+        slug = obj.get("slug")
+        if not slug:
+            continue
+        cut = obj.get("cutoff_date") or obj.get("date") or ""
+        if slug not in out or cut > out[slug]:
+            out[slug] = cut
+    return out
+
+
+def compute_done_slugs(ledger_path: Path, progress_path: Path,
+                       pruned_path: Path, max_retries: int = 3,
+                       requeued: dict[str, str] | None = None) -> set[str]:
+    """Slugs that must NOT be attempted again (outcome-based dedup).
+
+    A paper is DONE when ANY of:
+      * a record shows ``produced == True`` (a real reproduction), or
+      * a record's status is a terminal non-produced status
+        (skips / completed-minimal / exhausted), or
+      * it was explicitly pruned (``state/pruned_papers.jsonl``), or
+      * it has already been ATTEMPTED ``>= max_retries`` times.
+
+    Retryable infrastructure failures (usage/session limit, API 529, empty
+    output, timeout-with-no-output) do NOT, on their own, mark a paper done -
+    that is the fix for the burned-paper bug (docs/FAILURE_ANALYSIS.md): a run
+    killed by an account usage limit is re-attempted on a later run instead of
+    being recorded as a processed score-0 "minimal" forever.
+
+    ``requeued`` (slug -> cutoff date, e.g. from :func:`load_requeued`) FORGIVES
+    a paper's history: any run recorded on or before its cutoff date is ignored
+    for both done-marking and attempt-counting, and the slug is dropped from the
+    pruned set. A fresh outcome recorded AFTER the cutoff (i.e. on resume) counts
+    normally, so re-queuing a paper cannot loop it forever. This is how the 16
+    code-only papers (Amit directive 2026-07-12) become eligible again while the
+    other 190 pruned papers stay settled.
+    """
+    requeued = requeued or {}
+
+    def _forgiven(slug: str, rec: dict[str, Any]) -> bool:
+        # A record that proves a STRICT-contract reproduction is NEVER forgiven:
+        # a genuine success stays done even if the slug was re-queued with a
+        # later cutoff (2026-07-17 fix - the 07-19 requeue cutoff was forgetting
+        # a genuine 07-15 success and would have wastefully re-run it). Records
+        # claiming produced=True under the old WEAK contract (no metrics, no
+        # reproduced outputs - the stub bug) remain forgivable by design: those
+        # are exactly the papers the requeue exists to retry.
+        if rec.get("produced") is True and \
+                meets_reproduction_contract(rec.get("artifacts") or {}):
+            return False
+        cut = requeued.get(slug)
+        return cut is not None and (rec.get("date") or "") <= cut
+
+    done: set[str] = {s for s in _load_jsonl_slugs(pruned_path) if s not in requeued}
+    attempts: dict[str, int] = {}
+    for rec in _iter_jsonl(progress_path):
+        slug = rec.get("slug")
+        if not slug or _forgiven(slug, rec):
+            continue
+        if rec.get("run_status") is not None:
+            attempts[slug] = attempts.get(slug, 0) + 1
+        if rec.get("produced") is True:
+            done.add(slug)
+        st = rec.get("run_status") or rec.get("status")
+        if st in TERMINAL_NONPRODUCED_STATUSES:
+            done.add(slug)
+    for rec in _iter_jsonl(ledger_path):
+        slug = rec.get("slug")
+        if not slug or _forgiven(slug, rec):
+            continue
+        if rec.get("produced") is True:
+            done.add(slug)
+        st = rec.get("run_status") or rec.get("status")
+        if st in TERMINAL_NONPRODUCED_STATUSES:
+            done.add(slug)
+    if max_retries and max_retries > 0:
+        for slug, n in attempts.items():
+            if n >= max_retries:
+                done.add(slug)
+    return done
+
+
+def settle_exhausted(ledger_path: Path, progress_path: Path, pruned_path: Path,
+                     max_retries: int,
+                     requeued: dict[str, str] | None = None) -> list[str]:
+    """Write an honest EXHAUSTED_RETRIES ledger record for retry-capped papers.
+
+    A paper whose attempts reached ``max_retries`` without ever producing a
+    reproduction used to drop out of the queue SILENTLY (excluded by the
+    attempt cap in :func:`compute_done_slugs` but with no terminal record).
+    2026-07-17 fix: such papers are settled explicitly as EXHAUSTED_RETRIES in
+    the dedup ledger - a first-class, honest failure that downstream (webapp /
+    digest / public aggregates) can count, instead of an ambiguous stub.
+
+    Idempotent: a slug already carrying any terminal/produced record (or already
+    pruned) is never re-settled. Returns the slugs settled by this call.
+    """
+    if not max_retries or max_retries <= 0:
+        return []
+    requeued = requeued or {}
+
+    def _forgiven(slug: str, rec: dict[str, Any]) -> bool:
+        # mirror compute_done_slugs: only a STRICT-contract success is
+        # unforgivable; weak-contract produced stubs stay forgivable.
+        if rec.get("produced") is True and \
+                meets_reproduction_contract(rec.get("artifacts") or {}):
+            return False
+        cut = requeued.get(slug)
+        return cut is not None and (rec.get("date") or "") <= cut
+
+    attempts: dict[str, int] = {}
+    last_rec: dict[str, dict[str, Any]] = {}
+    settled: set[str] = {s for s in _load_jsonl_slugs(pruned_path) if s not in requeued}
+    for rec in list(_iter_jsonl(progress_path)) + list(_iter_jsonl(ledger_path)):
+        slug = rec.get("slug")
+        if not slug or _forgiven(slug, rec):
+            continue
+        if rec.get("produced") is True or \
+                (rec.get("run_status") or rec.get("status")) in TERMINAL_NONPRODUCED_STATUSES:
+            settled.add(slug)
+    for rec in _iter_jsonl(progress_path):
+        slug = rec.get("slug")
+        if not slug or _forgiven(slug, rec):
+            continue
+        if rec.get("run_status") is not None:
+            attempts[slug] = attempts.get(slug, 0) + 1
+            last_rec[slug] = rec
+    out: list[str] = []
+    today = datetime.now().strftime("%Y-%m-%d")
+    for slug, n in attempts.items():
+        if n < max_retries or slug in settled:
+            continue
+        prev = last_rec.get(slug, {})
+        append_jsonl(ledger_path, {
+            "slug": slug, "area": prev.get("area"), "title": prev.get("title"),
+            "date": today, "produced": False, "run_status": STATUS_EXHAUSTED,
+            "attempts": n,
+            "note": f"retry budget exhausted after {n} attempt(s); "
+                    f"last status: {prev.get('run_status')}",
+        })
+        out.append(slug)
+    return out
 
 
 def append_jsonl(path: Path, record: dict[str, Any]) -> None:
@@ -320,6 +786,25 @@ def verify_repo(url: str) -> bool:
         return True
 
 
+def _rmtree_robust(path: Path) -> None:
+    """rmtree that survives Windows read-only files (git object store).
+
+    ``shutil.rmtree(..., ignore_errors=True)`` silently LEAVES read-only files
+    behind on Windows - which is how stale ``.git`` dirs were surviving inside
+    src/upstream/. Clear the read-only bit and retry on each failure.
+    """
+    import stat
+
+    def _onerror(func, p, _exc):
+        try:
+            os.chmod(p, stat.S_IWRITE)
+            func(p)
+        except Exception:  # noqa: BLE001
+            pass
+    if path.exists():
+        shutil.rmtree(path, onerror=_onerror)
+
+
 def clone_repo(url: str, dest: Path) -> tuple[bool, str]:
     """Shallow-clone url into dest. GIT_TERMINAL_PROMPT=0 avoids credential hangs.
 
@@ -327,7 +812,7 @@ def clone_repo(url: str, dest: Path) -> tuple[bool, str]:
     the token into the clone URL so it can never leak into .git/config.
     """
     if dest.exists():
-        shutil.rmtree(dest, ignore_errors=True)
+        _rmtree_robust(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
     env["GIT_TERMINAL_PROMPT"] = "0"
@@ -341,13 +826,36 @@ def clone_repo(url: str, dest: Path) -> tuple[bool, str]:
     except FileNotFoundError:
         return (False, "git-not-found")
     except subprocess.TimeoutExpired:
-        shutil.rmtree(dest, ignore_errors=True)
+        _rmtree_robust(dest)
         return (False, "clone-timeout")
     if proc.returncode == 0 and dest.exists():
-        # drop the .git dir; we want the source as a starting point, not a submodule
-        shutil.rmtree(dest / ".git", ignore_errors=True)
-        return (True, "cloned")
-    shutil.rmtree(dest, ignore_errors=True)
+        # PIN THE COMMIT BEFORE DROPPING .git (reproducibility fix, 2026-07-12):
+        # we intentionally delete .git (we want the source as a starting point,
+        # not a submodule), but a reproduction must record WHICH commit it started
+        # from. Capture HEAD first and write it to UPSTREAM_PROVENANCE.json.
+        head_sha = ""
+        try:
+            rp = subprocess.run(["git", "-C", str(dest), "rev-parse", "HEAD"],
+                                env=env, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                text=True, timeout=30)
+            if rp.returncode == 0:
+                head_sha = rp.stdout.strip()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            (dest / "UPSTREAM_PROVENANCE.json").write_text(json.dumps({
+                "url": url,
+                "commit": head_sha or None,
+                "cloned_utc": datetime.utcnow().isoformat() + "Z",
+                "depth": 1,
+                "note": "shallow clone; .git removed after pinning HEAD",
+            }, indent=2), encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            pass
+        _rmtree_robust(dest / ".git")
+        return (True, f"cloned@{head_sha[:12]}" if head_sha else "cloned")
+    _rmtree_robust(dest)
     return (False, f"clone-failed({proc.returncode})")
 
 
@@ -680,8 +1188,25 @@ def _count_captions(paper_dir: Path) -> int:
         return 0
 
 
+def _count_own_src(src_dir: Path) -> int:
+    """Count .py files the AGENT wrote under src/, excluding src/upstream/.
+
+    The upstream clone is the authors' code, not the reproduction: counting it
+    (the pre-2026-07-17 behaviour) let a bare clone with zero agent work satisfy
+    the "has source code" leg of the produced contract.
+    """
+    if not src_dir.exists():
+        return 0
+    n = 0
+    for p in src_dir.rglob("*.py"):
+        if p.is_file() and "upstream" not in p.relative_to(src_dir).parts:
+            n += 1
+    return n
+
+
 def assess(paper_dir: Path) -> dict[str, Any]:
-    src_files = _count_files(paper_dir / "src", {".py"})
+    src_files = _count_own_src(paper_dir / "src")
+    upstream_files = _count_files(paper_dir / "src" / "upstream", {".py"})
     upstream = (paper_dir / "src" / "upstream").exists()
     original_figs = _count_files(paper_dir / "original_results", _IMG_EXTS)
     original_captions = _count_captions(paper_dir)
@@ -699,7 +1224,8 @@ def assess(paper_dir: Path) -> dict[str, Any]:
     has_summary_pdf = (paper_dir / "summary.pdf").exists()
     has_requirements = (paper_dir / "requirements.txt").exists()
     return {
-        "src_files": src_files,
+        "src_files": src_files,          # agent-written .py under src/ (upstream EXCLUDED)
+        "upstream_files": upstream_files,
         "has_upstream": upstream,
         "original_figs": original_figs,
         "original_captions": original_captions,
@@ -721,6 +1247,37 @@ def assess(paper_dir: Path) -> dict[str, Any]:
         "figures": reproduced_imgs,
         "has_results_json": has_metrics,
     }
+
+
+def meets_reproduction_contract(art: dict[str, Any]) -> bool:
+    """Strict artifact contract for claiming ``produced=True`` (a reproduction).
+
+    2026-07-17 tightening (Amit directive - failure investigation): the old
+    contract (any src file INCLUDING the upstream clone + any reproduced_results
+    file + a summary.pdf the HARNESS itself auto-generates) let scaffold-level
+    stubs be recorded as "reproduced". A run now counts as produced only when
+    ALL hold:
+
+      * agent-written source code exists under src/ (upstream clone excluded);
+      * a machine-readable reproduced_results/metrics.json exists whose own
+        verdict is "full" or "partial" (an honest agent-reported "minimal" or
+        "infeasible" is NOT a produced reproduction);
+      * real reproduced outputs exist (>=1 reproduced image or >=1 metric);
+      * the AGENT wrote summary.md (evaluate this contract on the assessment
+        taken BEFORE the harness synthesises its fallback summary).
+    """
+    if art.get("src_files", 0) <= 0:
+        return False
+    if not art.get("has_metrics"):
+        return False
+    verdict = (art.get("verdict") or "").strip().lower()
+    if verdict not in ("full", "partial"):
+        return False
+    if art.get("reproduced_imgs", 0) <= 0 and art.get("n_metrics", 0) <= 0:
+        return False
+    if not art.get("has_summary_md"):
+        return False
+    return True
 
 
 # -----------------------------------------------------------------------------
@@ -812,21 +1369,114 @@ def _build_prompt(rec: dict[str, Any], python_exe: str, repo_root: Path,
     )
 
 
+def _run_provenance(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Cheap, dependency-free run provenance for the record (reproducibility).
+
+    Records a config hash + coarse host fingerprint so every run report carries
+    the environment it ran in (uml_dev doctrine: pin hardware + config). Seeds
+    live inside each paper's own src/ (the agent sets them); the upstream commit
+    pin is written to src/upstream/UPSTREAM_PROVENANCE.json by clone_repo.
+    """
+    import hashlib
+    import platform
+    try:
+        cfg_hash = hashlib.sha256(
+            json.dumps(cfg.get("reproduce", {}), sort_keys=True).encode("utf-8")
+        ).hexdigest()[:12]
+    except Exception:  # noqa: BLE001
+        cfg_hash = None
+    return {
+        "config_hash": cfg_hash,
+        "host": {"os": platform.system(), "cpu_count": os.cpu_count(),
+                 "python": platform.python_version()},
+    }
+
+
+def _skiplist_slugs(repo_root: Path) -> set[str]:
+    p = repo_root / "state" / "security_skiplist.json"
+    if not p.exists():
+        return set()
+    try:
+        data = json.loads(p.read_text(encoding="utf-8", errors="replace"))
+    except Exception:  # noqa: BLE001
+        return set()
+    return {e.get("slug") for e in data.get("entries", []) if isinstance(e, dict) and e.get("slug")}
+
+
+def _write_skip_marker(paper_dir: Path, status: str, reason: str) -> None:
+    """Write the first-class skip marker file the assess/read_skip_status pair reads."""
+    (paper_dir / "reproduced_results").mkdir(parents=True, exist_ok=True)
+    if status == STATUS_SKIPPED_SECURITY:
+        (paper_dir / "reproduced_results" / "SECURITY_SKIP.txt").write_text(
+            f"{status}\n{reason}\n", encoding="utf-8")
+    elif status == STATUS_INELIGIBLE_HARDWARE:
+        (paper_dir / "reproduced_results" / "HARDWARE_SKIP.txt").write_text(
+            f"{status}\n{reason}\n", encoding="utf-8")
+    elif status == STATUS_NOT_REPRODUCIBLE:
+        (paper_dir / "NOT_REPRODUCIBLE.txt").write_text(
+            f"{status}\n{reason}\n", encoding="utf-8")
+
+
 def reproduce_one(cfg: dict[str, Any], rec: dict[str, Any], repo_root: Path,
-                  ledger_path: Path) -> dict[str, Any]:
+                  ledger_path: Path,
+                  pacer: "SpawnPacer | None" = None) -> dict[str, Any]:
     area = rec["area_code"]
     title = rec["title"]
     slug = slugify(title)
     paper_dir = repo_root / area / slug
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    def _finish(status: str, produced: bool, art: dict[str, Any],
+                repo_info: dict[str, Any], elapsed: int, code: int,
+                logf: Path | None, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Build the run record and append to the dedup ledger ONLY on a terminal
+        outcome. Retryable infra failures are recorded in progress (by the caller)
+        but NOT burned into the ledger, so the paper is re-attempted later."""
+        terminal = bool(produced) or status in TERMINAL_NONPRODUCED_STATUSES
+        record = {
+            "slug": slug, "area": area, "title": title, "date": today,
+            "run_status": status, "exit_code": code, "elapsed_s": elapsed,
+            "github_repo": repo_info.get("cloned_url"),
+            "github_candidates": repo_info.get("candidates", []),
+            "artifacts": art, "produced": produced,
+            "terminal": terminal, "retryable": status in RETRYABLE_STATUSES,
+            "provenance": _run_provenance(cfg),
+            "log": str(logf) if logf else None, "paper_dir": str(paper_dir),
+        }
+        if extra:
+            record.update(extra)
+        if terminal:
+            append_jsonl(ledger_path, {
+                "slug": slug, "area": area, "title": title, "date": today,
+                "produced": produced, "run_status": status,
+                "github_repo": repo_info.get("cloned_url"),
+            })
+        return record
 
     # 1. scaffold canonical structure + drop in paper.pdf / paper.md
     scaffold(paper_dir, rec.get("local_pdf"), rec.get("local_markdown"))
 
-    # read extracted text for repo/data discovery
+    # read extracted text for repo/data discovery + pre-screen
     md_text = ""
     md_local = paper_dir / "paper.md"
     if md_local.exists():
         md_text = md_local.read_text(encoding="utf-8", errors="replace")
+
+    # 1b. CHEAP PRE-SCREEN (before any clone/figure-extract/claude spawn):
+    # on a strong security / survey / hardware-scale signal, skip claude entirely
+    # and record a first-class terminal status - never download an adversarial
+    # repo or start a doomed hardware run (HARDWARE_ENVELOPE / DOWNLOAD_SAFETY).
+    pre = pre_screen(title, md_text, cfg)
+    if pre in (STATUS_SKIPPED_SECURITY, STATUS_INELIGIBLE_HARDWARE, STATUS_NOT_REPRODUCIBLE):
+        reason = f"pre-screen: {pre} (no claude spawn)"
+        _write_skip_marker(paper_dir, pre, reason)
+        empty_repo_info: dict[str, Any] = {"candidates": [], "cloned_url": None}
+        art = assess(paper_dir)
+        ensure_summary_pdf(paper_dir, rec, art, empty_repo_info)
+        art = assess(paper_dir)
+        print(f"    [pre-screen] {pre} -> skipping claude spawn")
+        return _finish(pre, False, art, empty_repo_info, 0, 0, None,
+                       {"pre_screen": pre})
 
     # 2. locate + clone the paper's official repo into src/upstream/
     repo_info = locate_and_clone_repo(paper_dir, md_text, rec)
@@ -841,6 +1491,26 @@ def reproduce_one(cfg: dict[str, Any], rec: dict[str, Any], repo_root: Path,
         print(f"    [wiki] injected {wiki_note.count(chr(10)) - 1} related concept page(s) "
               f"into the reproduction prompt")
     prompt = _build_prompt(rec, python_exe, repo_root, repo_info, n_figs, wiki_note)
+
+    # CONTINUATION (segmented budget across retries, 2026-07-17): if a previous
+    # attempt already left agent-written code / partial outputs in this paper
+    # dir, tell the agent to FINISH that work instead of restarting from
+    # scratch - this is how a paper that outgrows one per-paper time slice
+    # accumulates a real reproduction across bounded retries.
+    pre_art = assess(paper_dir)
+    if pre_art["src_files"] > 0 or pre_art["reproduced_files"] > 0:
+        prompt = (
+            "CONTINUATION OF A PREVIOUS ATTEMPT: this directory already contains "
+            "partial work from an earlier bounded run (src/ code and possibly "
+            "partial reproduced_results/). Do NOT start over and do NOT rewrite "
+            "working code: read what exists, fix/finish it, RUN it, and complete "
+            "the missing deliverables (reproduced_results/metrics.json + figures, "
+            "tests, summary.md). Prioritise producing final results over "
+            "refactoring.\n\n" + prompt
+        )
+        print(f"    [continue] prior partial work detected "
+              f"(src={pre_art['src_files']}, repro_files={pre_art['reproduced_files']}) "
+              f"-> continuation prompt")
     minutes = cfg.get("reproduce", {}).get("per_paper_minutes", 35)
     claude_exe = pipeline_paths.claude_exe(cfg)
     logs = repo_root / "logs"
@@ -848,38 +1518,43 @@ def reproduce_one(cfg: dict[str, Any], rec: dict[str, Any], repo_root: Path,
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     logf = logs / f"reproduce-{slug[:40]}-{stamp}.log"
 
+    # inter-spawn pacing: enforce a minimum gap between claude spawns so a cycle
+    # cannot machine-gun the account API (Amit directive 2026-07-12). Applied
+    # only here, where a spawn actually happens - pre-screen skips return earlier
+    # and never consume pacing budget.
+    if pacer is not None:
+        slept = pacer.wait()
+        if slept > 0:
+            print(f"    [pace] waited {slept:.0f}s before spawn "
+                  f"(min gap {pacer.min_seconds:.0f}s)")
+
     started = datetime.now()
-    status, code = run_claude(claude_exe, repo_root, paper_dir, prompt, minutes, logf)
+    raw_status, code = run_claude(claude_exe, repo_root, paper_dir, prompt, minutes, logf)
     elapsed = int((datetime.now() - started).total_seconds())
 
-    # 5. assess + guarantee summary.pdf
+    # 5. STRICT produced contract, evaluated BEFORE the harness synthesises its
+    # fallback summary (so the harness's own summary.pdf can never satisfy the
+    # agent-summary leg). See meets_reproduction_contract for the full rule.
     art = assess(paper_dir)
+    produced = meets_reproduction_contract(art)
     ensure_summary_pdf(paper_dir, rec, art, repo_info)
-    art = assess(paper_dir)  # re-assess (summary.pdf/md may now exist)
+    art = assess(paper_dir)  # re-assess for the record (summary.pdf/md may now exist)
 
-    produced = (
-        art["src_files"] > 0
-        and (art["reproduced_files"] > 0 or art["has_metrics"])
-        and art["has_summary_pdf"]
-    )
+    # 5b. classify the outcome into the status vocabulary. A skip file the agent
+    # wrote (or the security skiplist) wins; otherwise infra signatures in the
+    # log map to retryable BLOCKED_* / EMPTY_OUTPUT / TIMEOUT_* so an
+    # account-limit death or a budget kill does not masquerade as a processed
+    # "minimal"/"reproduced" paper.
+    try:
+        log_text = logf.read_text(encoding="utf-8", errors="replace")[:200_000] if logf.exists() else ""
+    except Exception:  # noqa: BLE001
+        log_text = ""
+    skip_status = read_skip_status(paper_dir, _skiplist_slugs(repo_root))
+    partial_output = art["src_files"] > 0 or art["reproduced_files"] > 0
+    status = classify_run_outcome(log_text, raw_status, produced, skip_status,
+                                  elapsed_s=elapsed, partial_output=partial_output)
 
-    record = {
-        "slug": slug, "area": area, "title": title,
-        "date": datetime.now().strftime("%Y-%m-%d"),
-        "run_status": status, "exit_code": code, "elapsed_s": elapsed,
-        "github_repo": repo_info.get("cloned_url"),
-        "github_candidates": repo_info.get("candidates", []),
-        "artifacts": art, "produced": produced,
-        "log": str(logf), "paper_dir": str(paper_dir),
-    }
-
-    # 6. append the dedup ledger so this paper is never re-attempted blindly
-    append_jsonl(ledger_path, {
-        "slug": slug, "area": area, "title": title,
-        "date": record["date"], "produced": produced,
-        "run_status": status, "github_repo": repo_info.get("cloned_url"),
-    })
-    return record
+    return _finish(status, produced, art, repo_info, elapsed, code, logf)
 
 
 # -----------------------------------------------------------------------------
@@ -932,7 +1607,24 @@ def main() -> int:
     state = repo_root / "state"
     progress_path = state / "progress.jsonl"
     ledger_path = state / "processed_ledger.jsonl"
-    done = already_processed(ledger_path, progress_path)
+    pruned_path = state / "pruned_papers.jsonl"
+    # Outcome-based dedup (not mere presence): retryable infra failures do NOT
+    # burn a paper, so a run killed by an account usage limit is re-attempted
+    # (bounded by reproduce.max_retries). Pruned + terminal outcomes stay skipped.
+    max_retries = int(cfg.get("reproduce", {}).get("max_retries", 3))
+    requeued = load_requeued(state / "requeued_papers.jsonl")
+    # settle retry-capped papers as honest EXHAUSTED_RETRIES ledger records
+    # (first-class failures, never silent drop-outs) before computing dedup.
+    exhausted = settle_exhausted(ledger_path, progress_path, pruned_path,
+                                 max_retries, requeued)
+    if exhausted:
+        print(f"[reproduce] settled {len(exhausted)} paper(s) as EXHAUSTED_RETRIES "
+              f"(retry budget spent): {', '.join(sorted(exhausted)[:8])}"
+              + (" ..." if len(exhausted) > 8 else ""))
+    done = compute_done_slugs(ledger_path, progress_path, pruned_path, max_retries, requeued)
+    if requeued:
+        print(f"[reproduce] {len(requeued)} re-queued paper(s) forgiven and eligible "
+              f"again (state/requeued_papers.jsonl)")
 
     hdir = state / "harvests"
     if args.backfill:
@@ -945,6 +1637,19 @@ def main() -> int:
     todo = gather_todo(repo_root, harvest_files, done, cap)
     print(f"[reproduce] {len(todo)} paper(s) to attempt "
           f"(cap={cap}, already-processed={len(done)})")
+
+    # quota pacing: minimum gap between spawns + circuit-breaker after K
+    # consecutive quota-limit outcomes (Amit directive 2026-07-12).
+    pacing = cfg.get("reproduce", {}).get("pacing", {}) or {}
+    consecutive_limit_stop = int(pacing.get("consecutive_limit_stop",
+                                            DEFAULT_CONSECUTIVE_LIMIT_STOP))
+    min_between = float(pacing.get("min_seconds_between_calls",
+                                   DEFAULT_MIN_SECONDS_BETWEEN_CALLS))
+    pacer = SpawnPacer(min_between)
+    quota_streak = 0
+    print(f"[reproduce] pacing: >= {min_between:.0f}s between spawns; circuit-breaker "
+          + (f"after {consecutive_limit_stop} consecutive quota-limit outcome(s)"
+             if consecutive_limit_stop > 0 else "disabled"))
 
     summary = {"date": datetime.now().strftime("%Y-%m-%d"),
                "attempted": 0, "produced": 0, "records": []}
@@ -959,18 +1664,19 @@ def main() -> int:
                 break
         print(f"\n[{i}/{len(todo)}] {rec['area_code']} :: {rec['title'][:90]}")
         try:
-            out = reproduce_one(cfg, rec, repo_root, ledger_path)
+            out = reproduce_one(cfg, rec, repo_root, ledger_path, pacer=pacer)
         except Exception as exc:  # noqa: BLE001
             print(f"    !! error: {exc}")
+            # harness-error is RETRYABLE: record it in progress (audit + attempt
+            # counter) but do NOT append to the dedup ledger, so a transient
+            # harness crash does not permanently burn the paper.
             out = {
                 "slug": slugify(rec.get("title", "")), "area": rec.get("area_code"),
                 "title": rec.get("title"), "date": datetime.now().strftime("%Y-%m-%d"),
-                "run_status": "harness-error", "exit_code": -3, "elapsed_s": 0,
-                "error": str(exc), "produced": False, "artifacts": {},
+                "run_status": STATUS_HARNESS_ERROR, "exit_code": -3, "elapsed_s": 0,
+                "error": str(exc), "produced": False, "terminal": False,
+                "retryable": True, "artifacts": {},
             }
-            append_jsonl(ledger_path, {
-                "slug": out["slug"], "area": out["area"], "title": out["title"],
-                "date": out["date"], "produced": False, "run_status": "harness-error"})
         append_jsonl(progress_path, out)
         summary["attempted"] += 1
         summary["produced"] += 1 if out.get("produced") else 0
@@ -982,6 +1688,16 @@ def main() -> int:
               f"verdict={a.get('verdict') or '-'} tests={a.get('tests', 0)} "
               f"manim={a.get('manim_files', 0)} pdf={a.get('has_summary_pdf', False)} "
               f"{out.get('elapsed_s', 0)}s")
+
+        # circuit-breaker: stop the cycle on K consecutive quota/limit outcomes so
+        # a burst cannot exhaust the account budget and burn the remaining papers.
+        # Outcome-based dedup keeps the un-attempted papers eligible next cycle.
+        quota_streak = update_quota_streak(out.get("run_status"), quota_streak)
+        if quota_circuit_tripped(quota_streak, consecutive_limit_stop):
+            print(f"[reproduce] quota exhausted - stopping cycle to preserve budget; "
+                  f"remaining papers retried next cycle "
+                  f"({quota_streak} consecutive quota-limit outcome(s)).")
+            break
 
     sdir = state / "daily"
     sdir.mkdir(parents=True, exist_ok=True)
