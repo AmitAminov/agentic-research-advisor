@@ -11,13 +11,14 @@ the answer is "it didn't".
 The interesting artifact in this repository is the orchestration layer, not the
 reproductions themselves.
 
-> **Curated public snapshot.** This repository contains the harness (`scripts/`,
-> `tests/`) and the dashboard **shell** (`webapp/`). The per-paper reproduction
-> outputs — the `AI/`, `DS/`, `ML/`, `DL/` trees, harvested paper PDFs, and every
-> extracted or reproduced figure — are intentionally **omitted** here (third-party
-> paper content and repository size); they live in the private working repo. The
-> dashboard is included to show the interface, with paper thumbnails and
-> per-paper detail pages removed.
+> **Curated public snapshot.** This repo is just the harness (`scripts/`,
+> `tests/`) and the dashboard **shell** (`webapp/`). I've **left out** the per-paper
+> reproduction outputs on purpose — the `AI/`, `DS/`, `ML/`, `DL/` trees, the
+> harvested paper PDFs, and every figure the pipeline extracted or reproduced —
+> partly because it's third-party paper content and partly because it makes the
+> repo huge; that stuff lives in the private working repo. I left the dashboard in
+> so you can see the interface, just with the paper thumbnails and per-paper detail
+> pages taken out.
 
 ---
 
@@ -164,10 +165,11 @@ the ranker files under those areas.
 
 ## Setup
 
-**Platform:** the orchestration layer is Windows-oriented (PowerShell, Task
-Scheduler, `taskkill`) and is run on Windows 11 + Python 3.10. The Python
-harness code itself is cross-platform (CI runs the test suite on Ubuntu), but
-the scheduled end-to-end pipeline assumes Windows.
+**Platform.** The orchestration layer grew up on Windows — PowerShell, Task
+Scheduler, `taskkill` for the process-tree kills — and I run it on Windows 11
+with Python 3.10. The harness code underneath doesn't care about the OS (its
+tests run on Ubuntu in CI); only the scheduled end-to-end pipeline really needs
+Windows.
 
 ```powershell
 git clone <this repo>
